@@ -12,19 +12,23 @@
                 </tr>
             </thead>
             <tbody>
-                <tr v-for="user in filteredUsers" :key="user.serial">
-                    <td>{{ user.name }}</td>
-                    <td>{{ user.serial }}</td>
+                <tr v-for="user in filteredUsers" :key="user.device_id">
+                    <td>{{ user.device_name }}</td>
+                    <td>{{ user.device_id }}</td>
+                    <td>{{ formatUserType(user.user_type) }}</td>
                     <td>
-                        <select v-model="user.category">
-                            <option value="trusted">可信</option>
-                            <option value="regular">普通</option>
-                            <option value="blacklist">黑名单</option>
-                        </select>
-                    </td>
-                    <td>
-                        <button @click="updateUser(user)">更改类别</button>
-                        <button @click="deleteUser(user.serial)">删除</button>
+                        <div v-if="editingUserId === user.device_id">
+                            <select @change="selectCategory(user, $event)">
+                                <option disabled selected value="">请选择新类别</option>
+                                <option v-for="type in availableCategories(user.user_type)" :key="type" :value="type">
+                                    {{ formatUserType(type) }}
+                                </option>
+                            </select>
+                        </div>
+                        <div v-else>
+                            <button @click="startEditing(user.device_id)">更改类别</button>
+                            <button @click="deleteUser(user.device_id)">删除</button>
+                        </div>
                     </td>
                 </tr>
             </tbody>
@@ -41,15 +45,56 @@ export default {
         const users = ref([]);
         const searchQuery = ref("");
 
+        const editingUserId = ref(null); // 正在编辑的 user.device_id
+
+        const userTypeLabels = {
+            trusted: "可信",
+            regular: "普通",
+            blacklist: "黑名单"
+        };
+
+        const formatUserType = (type) => {
+            return userTypeLabels[type] || "未知";
+        };
+
+        const availableCategories = (currentType) => {
+            return Object.keys(userTypeLabels).filter((t) => t !== currentType);
+        };
+
+        function startEditing(deviceId) {
+            editingUserId.value = deviceId;
+        }
+
+        async function selectCategory(user, event) {
+            const newType = event.target.value;
+            if (!newType || newType === user.user_type) {
+                return; // 未选择或没变更就不处理
+            }
+
+            try {
+                await invoke("update_user_type", {
+                    serial: user.device_id,
+                    usertype: newType
+                });
+                user.user_type = newType;
+                editingUserId.value = null;
+                alert("用户类别更新成功");
+            } catch (error) {
+                console.error("更新用户类别失败:", error);
+            }
+        }
+
+
         const filteredUsers = computed(() => {
             return users.value.filter(user =>
-                user.name.includes(searchQuery.value) || user.serial.includes(searchQuery.value)
+                user.device_name?.includes(searchQuery.value) || user.device_id?.includes(searchQuery.value)
             );
         });
 
         async function fetchUsers() {
             try {
-                users.value = await invoke("get_users");
+                users.value = await invoke("get_user_info");
+                console.log("成功获取用户信息:", users.value);
             } catch (error) {
                 console.error("获取用户列表失败:", error);
             }
@@ -57,7 +102,7 @@ export default {
 
         async function updateUser(user) {
             try {
-                await invoke("update_user_category", { serial: user.serial, category: user.category });
+                await invoke("update_user_type", { serial: user.device_id, category: user.user_type });
                 alert("用户类别更新成功");
             } catch (error) {
                 console.error("更新用户类别失败:", error);
@@ -68,7 +113,7 @@ export default {
             if (confirm("确定删除该用户？")) {
                 try {
                     await invoke("delete_user", { serial });
-                    users.value = users.value.filter(u => u.serial !== serial);
+                    users.value = users.value.filter(u => u.device_id !== serial);
                 } catch (error) {
                     console.error("删除用户失败:", error);
                 }
@@ -77,7 +122,12 @@ export default {
 
         onMounted(fetchUsers);
 
-        return { searchQuery, filteredUsers, updateUser, deleteUser };
+        return {
+            searchQuery, filteredUsers, updateUser, deleteUser, editingUserId,
+            formatUserType,
+            availableCategories,
+            startEditing, selectCategory,
+        };
     }
 };
 </script>
