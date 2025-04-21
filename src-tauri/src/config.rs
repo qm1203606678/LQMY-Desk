@@ -1,8 +1,10 @@
 use actix_web::web;
 use lazy_static::lazy_static;
 use rand::{distr::Alphanumeric, Rng};
-use std::env;
+use std::ops::Deref;
+use std::path::Path;
 use std::sync::Mutex;
+use std::{env, path::PathBuf};
 
 use crate::server_utils::{
     auth::AuthRequest,
@@ -28,11 +30,21 @@ lazy_static! {
         device_id:NO_CONNECTION_INDENTIFIER.to_string(),
         user_type:UserType::Normal
     });
+    pub static ref APPDATA_PATH:Mutex<PathBuf>=Mutex::new(load_storage_path());
     // JWT加密密钥，每次启动不一样
     pub static ref JWT_KEY:Mutex<String>=Mutex::new(generate_jwt_key());
     // 标识jwt是本次启动生成的
     pub static ref THIS_TIME:Mutex<String>=Mutex::new(generate_jwt_key());
     //已经移到user_manage.rs管理 pub static ref DEVICE_LIST: Mutex<HashMap<String, DeviceInfo>> = Mutex::new(HashMap::new());// 没有放到CONFIG，为了减少不必要的并发访问冲突
+}
+
+fn load_storage_path() -> PathBuf {
+    "E:/WHU/SoftwareEngineering/GroupWork/LQMY-Desk".into()
+}
+
+pub fn get_userinfo_path() -> PathBuf {
+    let path = APPDATA_PATH.lock().unwrap();
+    path.join("user_data.json")
 }
 
 fn generate_jwt_key() -> String {

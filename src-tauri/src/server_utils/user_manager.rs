@@ -1,13 +1,12 @@
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 
+use crate::config::get_userinfo_path;
+
 use super::dialog::show_confirmation_dialog;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Mutex;
-
-static STORAGE_FILE: &str = "user_data.json";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UserType {
@@ -32,8 +31,8 @@ lazy_static! {
 
 /// 读取本地存储的设备信息
 fn load_devices() -> HashMap<String, UserInfo> {
-    if let Ok(data) = fs::read_to_string(STORAGE_FILE) {
-        println!("[USER_LIST:成功从{:?}读取用户信息]", STORAGE_FILE);
+    if let Ok(data) = fs::read_to_string(get_userinfo_path()) {
+        println!("[USER_LIST:成功从{:?}读取用户信息]", get_userinfo_path());
         serde_json::from_str(&data).unwrap_or_else(|_| HashMap::new())
     } else {
         println!("[USER_LIST:路径下没有json文件,用户信息表初始化为空]");
@@ -45,7 +44,7 @@ fn load_devices() -> HashMap<String, UserInfo> {
 fn save_devices() {
     let devices = USER_LIST.lock().unwrap();
     if let Ok(json) = serde_json::to_string(&*devices) {
-        let _ = fs::write(STORAGE_FILE, json);
+        let _ = fs::write(get_userinfo_path(), json);
     }
 }
 
@@ -83,6 +82,7 @@ pub struct UserInfoString {
     pub user_type: String,
 }
 pub async fn transfer_userinfo_to_vue() -> Vec<UserInfoString> {
+    load_devices();
     let userlist = USER_LIST.lock().unwrap();
     userlist
         .values()
@@ -140,4 +140,16 @@ pub async fn update_user_category(serial: String, usertype: String) {
     };
     drop(users);
     save_devices();
+}
+
+pub async fn delete_user(serial: String) {
+    let mut users = USER_LIST.lock().unwrap();
+    let removed = users.remove_entry(&serial);
+    drop(users);
+    if let Some(rem) = removed {
+        save_devices();
+        println!("[USER_INFO]用户信息{:?}删除", rem)
+    } else {
+        println!("[USER_INFO]设备{:?}不存在，删除失败", &serial)
+    }
 }

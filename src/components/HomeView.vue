@@ -34,32 +34,21 @@
 <script>
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { useServerStore } from "../stores/server";
 
 export default {
     setup() {
-        const isRunning = ref(false);
-        const serverAddress = ref("");
-        const connectionPassword = ref("");
+        const serverStore = useServerStore();
 
-        const statusMessage = computed(() => (isRunning.value ? "运行中" : "未启动"));
-        const statusClass = computed(() => (isRunning.value ? "running" : "stopped"));
+        const statusMessage = computed(() => (serverStore.isRunning ? "运行中" : "未启动"));
+        const statusClass = computed(() => (serverStore.isRunning ? "running" : "stopped"));
 
-        const currentUser = ref({
-            device_name: "",
-            device_id: "!@#$%^&*()",
-            user_type: "Normal",
-        });
-
-        // 定时器 id，用于组件卸载时清除
         let timerId = null;
+
         async function fetchServerInfo() {
             try {
                 const [address, password, name, id, type] = await invoke("get_server_info");
-                serverAddress.value = address;
-                connectionPassword.value = password;
-                currentUser.value.device_name = name;
-                currentUser.value.device_id = id;
-                currentUser.value.user_type = type;
+                serverStore.updateServerInfo(address, password, name, id, type);
             } catch (error) {
                 console.error("获取服务器信息失败:", error);
             }
@@ -68,7 +57,7 @@ export default {
         async function startServer() {
             try {
                 await invoke("start_server");
-                isRunning.value = true;
+                serverStore.isRunning = true;
                 fetchServerInfo();
             } catch (error) {
                 console.error("启动服务器失败:", error);
@@ -78,7 +67,7 @@ export default {
         async function stopServer() {
             try {
                 await invoke("stop_server");
-                isRunning.value = false;
+                serverStore.isRunning = false;
             } catch (error) {
                 console.error("停止服务器失败:", error);
             }
@@ -86,25 +75,33 @@ export default {
 
         onMounted(async () => {
             fetchServerInfo();
-            // 轮询
             timerId = setInterval(fetchServerInfo, 5000);
-            try {
-                const response = await fetch("http://127.0.0.1:9876/health");
-                isRunning.value = response.ok;
-            } catch (error) {
-                isRunning.value = false;
-            }
-
+            // try {
+            //     const response = await fetch("http://127.0.0.1:9876/health");
+            //     serverStore.isRunning = response.ok;
+            // } catch (error) {
+            //     serverStore.isRunning = false;
+            // }
         });
 
         onUnmounted(() => {
-            // 清除定时器，避免内存泄漏
             clearInterval(timerId);
         });
 
-        return { isRunning, serverAddress, connectionPassword, statusMessage, statusClass, startServer, stopServer, fetchServerInfo, currentUser };
+        return {
+            statusMessage,
+            statusClass,
+            startServer,
+            stopServer,
+            fetchServerInfo,
+            serverAddress: computed(() => serverStore.serverAddress),
+            connectionPassword: computed(() => serverStore.connectionPassword),
+            currentUser: computed(() => serverStore.currentUser),
+            isRunning: computed(() => serverStore.isRunning),
+        };
     }
 };
+
 </script>
 
 <style scoped>

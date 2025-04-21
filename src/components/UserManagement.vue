@@ -86,9 +86,14 @@ export default {
 
 
         const filteredUsers = computed(() => {
-            return users.value.filter(user =>
-                user.device_name?.includes(searchQuery.value) || user.device_id?.includes(searchQuery.value)
-            );
+            const query = searchQuery.value.trim().toLowerCase();
+            if (!query) return users.value;
+
+            return users.value.filter(user => {
+                const name = user.device_name?.toLowerCase() || "";
+                const serial = user.device_id?.toLowerCase() || "";
+                return name.includes(query) || serial.includes(query);
+            });
         });
 
         async function fetchUsers() {
@@ -112,7 +117,7 @@ export default {
         async function deleteUser(serial) {
             if (confirm("确定删除该用户？")) {
                 try {
-                    await invoke("delete_user", { serial });
+                    await invoke("delete_userinfo", { serial });
                     users.value = users.value.filter(u => u.device_id !== serial);
                 } catch (error) {
                     console.error("删除用户失败:", error);

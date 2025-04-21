@@ -8,7 +8,10 @@ mod webrtc;
 use std::sync::{Arc, Mutex};
 
 use config::{reset_cur_user, CONFIG, CURRENT_USER};
-use server_utils::user_manager::{transfer_userinfo_to_vue, update_user_category, UserInfoString};
+use server_utils::user_manager::{
+    delete_user, transfer_userinfo_to_vue, update_user_category, UserInfoString,
+};
+use tauri::Manager;
 //use actix_web::{web, App, HttpServer, HttpResponse};
 //use tauri::Manager;
 
@@ -65,6 +68,10 @@ async fn get_user_info() -> Vec<UserInfoString> {
 async fn update_user_type(serial: String, usertype: String) {
     update_user_category(serial, usertype).await;
 }
+#[tauri::command]
+async fn delete_userinfo(serial: String) {
+    delete_user(serial).await
+}
 fn main() {
     tauri::Builder::default()
         .manage(AppState {
@@ -75,7 +82,8 @@ fn main() {
             stop_server,
             get_server_info,
             get_user_info,
-            update_user_type
+            update_user_type,
+            delete_userinfo
         ])
         .run(tauri::generate_context!())
         .expect("Failed to run Tauri application");
