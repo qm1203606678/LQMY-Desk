@@ -1,8 +1,6 @@
 use actix_web::web;
 use lazy_static::lazy_static;
 use rand::{distr::Alphanumeric, Rng};
-use std::ops::Deref;
-use std::path::Path;
 use std::sync::Mutex;
 use std::{env, path::PathBuf};
 
