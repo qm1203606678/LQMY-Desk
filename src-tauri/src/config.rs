@@ -19,7 +19,7 @@ pub struct Config {
 lazy_static! {
     // 服务器信息 websocket IP/ 连接口令
     pub static ref CONFIG: Mutex<Config> = Mutex::new(Config {
-        server_address: env::var("SERVER_ADDRESS").unwrap_or_else(|_| "127.0.0.1:9876".to_string()),
+        server_address: env::var("SERVER_ADDRESS").unwrap_or_else(|_| "0.0.0.0:9876".to_string()),
         connection_password: "Uninitia".to_string(),
     });
     // 当前连接用户信息

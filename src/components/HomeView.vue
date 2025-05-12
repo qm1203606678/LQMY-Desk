@@ -45,6 +45,14 @@ export default {
 
         let timerId = null;
 
+        serverStore.updateServerInfo = function (addr, pw, name, id, type) {
+            serverStore.serverAddress = addr;
+            serverStore.connectionPassword = pw;
+            serverStore.currentUser.device_name = name;
+            serverStore.currentUser.device_id = id;
+            serverStore.currentUser.user_type = type;
+        }
+
         async function fetchServerInfo() {
             try {
                 const [address, password, name, id, type] = await invoke("get_server_info");
