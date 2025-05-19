@@ -14,7 +14,7 @@ use client::start_client;
 use client_utils::user_manager::{
     delete_user, transfer_userinfo_to_vue, update_user_category, UserInfoString,
 };
-use config::{reset_cur_user, CONFIG, CURRENT_USER};
+use config::{reset_cur_user, CONFIG, CURRENT_USER, UUID};
 use tauri::async_runtime::block_on;
 //use actix_web::{web, App, HttpServer, HttpResponse};
 //use tauri::Manager;
@@ -31,7 +31,7 @@ fn start_server(state: tauri::State<AppState>) {
     std::thread::spawn(move || {
         let sys = actix_rt::System::new();
         *is_running.lock().unwrap() = true;
-
+        exit_flag.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = sys.block_on(async { client::start_client(exit_flag).await });
 
         *is_running.lock().unwrap() = false;
@@ -51,18 +51,20 @@ fn stop_server(state: tauri::State<AppState>) {
 }
 
 #[tauri::command]
-fn get_server_info() -> (String, String, String, String, String) {
+fn get_server_info() -> (String, String, String, String, String, String) {
     let config = CONFIG.lock().unwrap();
     println!(
         "[SERVER_INFO: Acquiring addr {:?} & password {:?}]",
         config.server_address, config.connection_password
     );
     let cur_user = CURRENT_USER.lock().unwrap();
+    let uuid = UUID.lock().unwrap();
     (
         config.server_address.clone(),
         config.connection_password.clone(),
         cur_user.device_name.clone(),
         cur_user.device_id.clone(),
+        uuid.clone(),
         format!("{:?}", cur_user.user_type),
     )
 }
@@ -80,6 +82,11 @@ async fn update_user_type(serial: String, usertype: String) {
 #[tauri::command]
 async fn delete_userinfo(serial: String) {
     delete_user(serial).await
+}
+
+#[tauri::command]
+async fn update_server_addr(ipaddr: String) {
+    config::update_server_addr(ipaddr)
 }
 fn main() {
     tauri::Builder::default()
@@ -101,7 +108,8 @@ fn main() {
             get_server_info,
             get_user_info,
             update_user_type,
-            delete_userinfo
+            delete_userinfo,
+            update_server_addr,
         ])
         .run(tauri::generate_context!())
         .expect("Failed to run Tauri application");

@@ -1,4 +1,5 @@
 use actix_web::web;
+use chrono::format::StrftimeItems;
 use lazy_static::lazy_static;
 use rand::{distr::Alphanumeric, Rng};
 use std::sync::Mutex;
@@ -85,4 +86,10 @@ pub fn reset_cur_user() {
 pub fn update_uuid(uuid: &str) {
     let mut cur_uuid = UUID.lock().unwrap();
     *cur_uuid = uuid.to_string();
+}
+
+pub fn update_server_addr(ipaddr: String) {
+    let mut config = CONFIG.lock().unwrap();
+    config.server_address = ipaddr;
+    println!("[CLIENT]所连服务器信息改变为:{:?}", config.server_address);
 }
