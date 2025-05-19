@@ -10,7 +10,7 @@ use std::{
     thread,
 };
 
-use client::start_client;
+use client::{start_client, CLOSE_NOTIFY};
 use client_utils::user_manager::{
     delete_user, transfer_userinfo_to_vue, update_user_category, UserInfoString,
 };
@@ -32,6 +32,7 @@ fn start_server(state: tauri::State<AppState>) {
         let sys = actix_rt::System::new();
         *is_running.lock().unwrap() = true;
         exit_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        println!("[CLIENT]exit_flag:{:?}", exit_flag);
         let _ = sys.block_on(async { client::start_client(exit_flag).await });
 
         *is_running.lock().unwrap() = false;
@@ -45,7 +46,12 @@ fn stop_server(state: tauri::State<AppState>) {
     state
         .exit_flag
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    println!("Exit flag set, client should shut down soon.");
+    println!(
+        "Exit flag set, client should shut down soon.{:?}",
+        state.exit_flag
+    );
+    CLOSE_NOTIFY.notify_one();
+
     reset_cur_user();
     println!("[SERVER_INFO: Server stopped.");
 }
@@ -53,19 +59,20 @@ fn stop_server(state: tauri::State<AppState>) {
 #[tauri::command]
 fn get_server_info() -> (String, String, String, String, String, String) {
     let config = CONFIG.lock().unwrap();
+    let uuid = UUID.lock().unwrap();
     println!(
-        "[SERVER_INFO: Acquiring addr {:?} & password {:?}]",
-        config.server_address, config.connection_password
+        "[SERVER_INFO: Acquiring addr {:?} & password {:?} & uuid {:?}]",
+        config.server_address, config.connection_password, uuid
     );
     let cur_user = CURRENT_USER.lock().unwrap();
-    let uuid = UUID.lock().unwrap();
+
     (
         config.server_address.clone(),
         config.connection_password.clone(),
         cur_user.device_name.clone(),
         cur_user.device_id.clone(),
-        uuid.clone(),
         format!("{:?}", cur_user.user_type),
+        uuid.clone(),
     )
 }
 

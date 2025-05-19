@@ -20,7 +20,7 @@
 
             <p><strong>当前服务器IP 地址:</strong> {{ serverAddress || "未获取" }}</p>
             <p><strong>连接口令:</strong> {{ connectionPassword || "无" }}</p>
-            <p><strong>本机编号:</strong>{{ currentUser.uuid }}</p>
+            <p><strong>本机编号:</strong>{{ currentUuid }}</p>
             <div class="user-info-card">
                 <h3>当前用户</h3>
                 <template v-if="currentUser.device_id !== '!@#$%^&*()'">
@@ -44,7 +44,7 @@ import { useServerStore } from "../stores/server";
 export default {
     setup() {
         const serverStore = useServerStore();
-        const inputIp = ref("尚未连接服务");
+        const inputIp = ref("");
         const statusMessage = computed(() => (serverStore.isRunning ? "运行中" : "未启动"));
         const statusClass = computed(() => (serverStore.isRunning ? "running" : "stopped"));
 
@@ -127,6 +127,7 @@ export default {
             connectionPassword: computed(() => serverStore.connectionPassword),
             currentUser: computed(() => serverStore.currentUser),
             isRunning: computed(() => serverStore.isRunning),
+            currentUuid: computed(() => serverStore.currentUuid)
         };
     }
 };

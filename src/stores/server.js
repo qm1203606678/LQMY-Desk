@@ -11,7 +11,7 @@ export const useServerStore = defineStore('server', () => {
     device_id: '!@#$%^&*()',
     user_type: 'Normal',
   });
-  const currentUuid = ref('尚未');
+  const currentUuid = ref('');
 
   return {
     isRunning,

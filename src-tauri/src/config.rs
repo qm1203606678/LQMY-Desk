@@ -86,6 +86,7 @@ pub fn reset_cur_user() {
 pub fn update_uuid(uuid: &str) {
     let mut cur_uuid = UUID.lock().unwrap();
     *cur_uuid = uuid.to_string();
+    println!("[CLIENT]服务器分配的uuid：{:?}", *cur_uuid)
 }
 
 pub fn update_server_addr(ipaddr: String) {
