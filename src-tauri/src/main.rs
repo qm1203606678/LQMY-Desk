@@ -1,33 +1,38 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod client;
+mod client_utils;
 mod config;
 mod error;
-mod server;
-mod server_utils;
 mod webrtc;
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{atomic::AtomicBool, Arc, Mutex},
+    thread,
+};
 
-use config::{reset_cur_user, CONFIG, CURRENT_USER};
-use server_utils::user_manager::{
+use client::start_client;
+use client_utils::user_manager::{
     delete_user, transfer_userinfo_to_vue, update_user_category, UserInfoString,
 };
-use tauri::Manager;
+use config::{reset_cur_user, CONFIG, CURRENT_USER};
+use tauri::async_runtime::block_on;
 //use actix_web::{web, App, HttpServer, HttpResponse};
 //use tauri::Manager;
 
-struct AppState {
-    is_running: Arc<Mutex<bool>>,
+pub struct AppState {
+    pub is_running: Arc<Mutex<bool>>,
+    pub exit_flag: Arc<AtomicBool>,
 }
 
 #[tauri::command]
 fn start_server(state: tauri::State<AppState>) {
     let is_running = state.is_running.clone();
-
+    let exit_flag = state.exit_flag.clone();
     std::thread::spawn(move || {
         let sys = actix_rt::System::new();
         *is_running.lock().unwrap() = true;
 
-        let _ = sys.block_on(async { server::start_server().await });
+        let _ = sys.block_on(async { client::start_client(exit_flag).await });
 
         *is_running.lock().unwrap() = false;
     });
@@ -37,6 +42,10 @@ fn start_server(state: tauri::State<AppState>) {
 fn stop_server(state: tauri::State<AppState>) {
     *state.is_running.lock().unwrap() = false;
     // 重置连接状况，将连接者信息清楚
+    state
+        .exit_flag
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    println!("Exit flag set, client should shut down soon.");
     reset_cur_user();
     println!("[SERVER_INFO: Server stopped.");
 }
@@ -74,8 +83,17 @@ async fn delete_userinfo(serial: String) {
 }
 fn main() {
     tauri::Builder::default()
+        // .setup(|_app| {
+        //     thread::spawn(|| {
+        //         if let Err(e) = block_on(start_client()) {
+        //             eprintln!("[CLIENT ERROR] {:?}", e);
+        //         }
+        //     });
+        //     Ok(())
+        // })
         .manage(AppState {
             is_running: Arc::new(Mutex::new(false)),
+            exit_flag: Arc::new(AtomicBool::new(false)),
         })
         .invoke_handler(tauri::generate_handler![
             start_server,

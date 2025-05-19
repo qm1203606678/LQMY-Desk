@@ -4,7 +4,7 @@ use rand::{distr::Alphanumeric, Rng};
 use std::sync::Mutex;
 use std::{env, path::PathBuf};
 
-use crate::server_utils::{
+use crate::client_utils::{
     auth::AuthRequest,
     user_manager::{UserInfo, UserType},
 };
@@ -19,7 +19,7 @@ pub struct Config {
 lazy_static! {
     // 服务器信息 websocket IP/ 连接口令
     pub static ref CONFIG: Mutex<Config> = Mutex::new(Config {
-        server_address: env::var("SERVER_ADDRESS").unwrap_or_else(|_| "0.0.0.0:9876".to_string()),
+        server_address: env::var("SERVER_ADDRESS").unwrap_or_else(|_| "wss://localhost:9876".to_string()),
         connection_password: "Uninitia".to_string(),
     });
     // 当前连接用户信息
@@ -34,6 +34,10 @@ lazy_static! {
     // 标识jwt是本次启动生成的
     pub static ref THIS_TIME:Mutex<String>=Mutex::new(generate_jwt_key());
     //已经移到user_manage.rs管理 pub static ref DEVICE_LIST: Mutex<HashMap<String, DeviceInfo>> = Mutex::new(HashMap::new());// 没有放到CONFIG，为了减少不必要的并发访问冲突
+    // 中转站分配的uuid
+    pub static ref UUID:Mutex<String>=Mutex::new("尚未连接服务器".to_string());
+    // websocket 客户端的连接，全局共享
+    //pub static ref WS_SENDER:Arc<Mutex<Option<awc::BoxedSocket>>>=Arc::new(Mutex::new(None));
 }
 
 fn load_storage_path() -> PathBuf {
@@ -76,4 +80,9 @@ pub fn reset_cur_user() {
         "[SERVER_INFO]连接用户信息重置为：设备名：{:?}，设备序列号：{:?}，用户类型：{:?}",
         cur_user.device_name, cur_user.device_id, cur_user.user_type
     );
+}
+
+pub fn update_uuid(uuid: &str) {
+    let mut cur_uuid = UUID.lock().unwrap();
+    *cur_uuid = uuid.to_string();
 }

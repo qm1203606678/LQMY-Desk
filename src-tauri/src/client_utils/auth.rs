@@ -1,5 +1,5 @@
+use crate::client_utils::user_manager::{add_device, get_user_by_serial};
 use crate::config::{update_cur_user, CONFIG, CURRENT_USER, NO_CONNECTION_INDENTIFIER, THIS_TIME};
-use crate::server_utils::user_manager::{add_device, get_user_by_serial};
 use actix_web::{web, HttpResponse, Responder};
 use chrono;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
@@ -22,13 +22,19 @@ pub struct AuthRequest {
     pub password: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AuthResponse {
+    pub status: String,
+    pub body: String,
+}
+
 /// websocket连接,处理逻辑: 1.判断服务端是否空闲
 ///                        2.根据用户类别处理
 ///                             （1）黑名单：直接拒绝
 ///                             （2）信任：返回jwt，不验证口令，更新CURRENT——USER
 ///                             （3）普通：口令正确，并且ui确认，则返回jwt，更新CURRENT——USER
 ///                             （4）新用户：口令正确，并且ui确认，则返回jwt，更新CURRENT——USER，添加新用户信息
-pub async fn authenticate(info: web::Json<AuthRequest>) -> impl Responder {
+pub async fn authenticate(info: web::Json<AuthRequest>) -> AuthResponse {
     {
         let cur_user = CURRENT_USER.lock().unwrap();
         if cur_user.device_id != NO_CONNECTION_INDENTIFIER {
@@ -36,7 +42,11 @@ pub async fn authenticate(info: web::Json<AuthRequest>) -> impl Responder {
                 "[SERVER_INFO]当前已连接设备,来自{:?}的连接请求直接拒绝",
                 cur_user.device_name
             );
-            return HttpResponse::Forbidden().body("已有设备连接，连接被拒绝");
+            //return HttpResponse::Forbidden().body("已有设备连接，连接被拒绝");
+            return AuthResponse {
+                status: "403".to_owned(),
+                body: "连接被拒绝".to_owned(),
+            };
         }
     }
     //let users = USER_LIST.lock().unwrap();
@@ -45,13 +55,21 @@ pub async fn authenticate(info: web::Json<AuthRequest>) -> impl Responder {
     match this_user {
         // 黑名单用户直接拒绝
         Some(user) if user.user_type == UserType::Blacklist => {
-            HttpResponse::Forbidden().body("连接被拒绝")
+            //HttpResponse::Forbidden().body("连接被拒绝")
+            AuthResponse {
+                status: "403".to_owned(),
+                body: "连接被拒绝".to_owned(),
+            }
         }
         // 信任用户直接返回jwt
         Some(user) if user.user_type == UserType::Trusted => {
             update_cur_user(&info, UserType::Trusted);
             let token = generate_jwt(&info.device_serial);
-            HttpResponse::Ok().json(token)
+            //HttpResponse::Ok().json(token)
+            AuthResponse {
+                status: "200".to_owned(),
+                body: token,
+            }
         }
         //普通用户，验证成功则返回jwt
         Some(user) if user.user_type == UserType::Normal => {
@@ -65,12 +83,24 @@ pub async fn authenticate(info: web::Json<AuthRequest>) -> impl Responder {
                 if show_confirmation_dialog("连接请求", &msg) {
                     update_cur_user(&info, UserType::Normal);
                     let token = generate_jwt(&info.device_serial);
-                    HttpResponse::Ok().json(token)
+                    //HttpResponse::Ok().json(token)
+                    AuthResponse {
+                        status: "200".to_owned(),
+                        body: token,
+                    }
                 } else {
-                    HttpResponse::Unauthorized().body("连接被拒绝")
+                    //HttpResponse::Unauthorized().body("连接被拒绝")
+                    AuthResponse {
+                        status: "403".to_owned(),
+                        body: "连接被拒绝".to_owned(),
+                    }
                 }
             } else {
-                HttpResponse::Unauthorized().body("连接口令错误")
+                //HttpResponse::Unauthorized().body("连接口令错误")
+                AuthResponse {
+                    status: "403".to_owned(),
+                    body: "连接口令错误".to_owned(),
+                }
             }
         }
         //新用户，验证成功则记录信息并返回jwt
@@ -87,12 +117,24 @@ pub async fn authenticate(info: web::Json<AuthRequest>) -> impl Responder {
                     let token = generate_jwt(&info.device_serial);
                     add_device(&info.device_name, &info.device_serial).await;
                     println!("[AUTH_INFO]生成jwt{:?}", token);
-                    HttpResponse::Ok().json(token)
+                    //HttpResponse::Ok().json(token)
+                    AuthResponse {
+                        status: "200".to_owned(),
+                        body: token,
+                    }
                 } else {
-                    HttpResponse::Unauthorized().body("连接被拒绝")
+                    //HttpResponse::Unauthorized().body("连接被拒绝")
+                    AuthResponse {
+                        status: "403".to_owned(),
+                        body: "连接被拒绝".to_owned(),
+                    }
                 }
             } else {
-                HttpResponse::Unauthorized().body("连接口令错误")
+                //HttpResponse::Unauthorized().body("连接口令错误")
+                AuthResponse {
+                    status: "403".to_owned(),
+                    body: "连接口令错误".to_owned(),
+                }
             }
         }
     }
