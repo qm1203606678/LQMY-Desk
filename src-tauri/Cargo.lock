@@ -2915,6 +2915,7 @@ dependencies = [
  "tauri-plugin-opener",
  "thiserror 1.0.69",
  "tokio",
+ "uuid",
  "webrtc",
  "webrtc-util 0.7.0",
 ]
