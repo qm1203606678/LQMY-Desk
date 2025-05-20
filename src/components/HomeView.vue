@@ -50,19 +50,20 @@ export default {
 
         let timerId = null;
 
-        serverStore.updateServerInfo = function (addr, pw, name, id, type, uuid) {
+        serverStore.updateServerInfo = function (addr, pw, name, id, type, uuid, isRunning) {
             serverStore.serverAddress = addr;
             serverStore.connectionPassword = pw;
             serverStore.currentUser.device_name = name;
             serverStore.currentUser.device_id = id;
             serverStore.currentUser.user_type = type;
             serverStore.currentUuid = uuid
+            serverStore.isRunning = isRunning
         }
 
         async function fetchServerInfo() {
             try {
-                const [address, password, name, id, type, uuid] = await invoke("get_server_info");
-                serverStore.updateServerInfo(address, password, name, id, type, uuid);
+                const [address, password, name, id, type, uuid, isRunning] = await invoke("get_server_info");
+                serverStore.updateServerInfo(address, password, name, id, type, uuid, isRunning);
             } catch (error) {
                 console.error("获取服务器信息失败:", error);
             }
@@ -82,6 +83,7 @@ export default {
             try {
                 await invoke("stop_server");
                 serverStore.isRunning = false;
+                fetchServerInfo();
             } catch (error) {
                 console.error("停止服务器失败:", error);
             }

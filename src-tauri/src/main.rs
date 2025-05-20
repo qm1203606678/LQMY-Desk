@@ -5,22 +5,22 @@ mod client_utils;
 mod config;
 mod error;
 mod webrtc;
-use std::{
-    sync::{atomic::AtomicBool, Arc, Mutex},
-    thread,
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
-use client::{start_client, CLOSE_NOTIFY};
+use client::CLOSE_NOTIFY;
 use client_utils::user_manager::{
     delete_user, transfer_userinfo_to_vue, update_user_category, UserInfoString,
 };
-use config::{reset_cur_user, CONFIG, CURRENT_USER, UUID};
-use tauri::async_runtime::block_on;
+use config::{reset_all_info, reset_cur_user, CONFIG, CURRENT_USER, UUID};
+
 //use actix_web::{web, App, HttpServer, HttpResponse};
 //use tauri::Manager;
 
 pub struct AppState {
-    pub is_running: Arc<Mutex<bool>>,
+    pub is_running: Arc<AtomicBool>,
     pub exit_flag: Arc<AtomicBool>,
 }
 
@@ -30,18 +30,20 @@ fn start_server(state: tauri::State<AppState>) {
     let exit_flag = state.exit_flag.clone();
     std::thread::spawn(move || {
         let sys = actix_rt::System::new();
-        *is_running.lock().unwrap() = true;
+        is_running.store(true, Ordering::Relaxed);
         exit_flag.store(false, std::sync::atomic::Ordering::Relaxed);
         println!("[CLIENT]exit_flag:{:?}", exit_flag);
         let _ = sys.block_on(async { client::start_client(exit_flag).await });
 
-        *is_running.lock().unwrap() = false;
+        is_running.store(false, Ordering::Relaxed);
+        reset_all_info();
+        reset_cur_user();
     });
 }
 
 #[tauri::command]
 fn stop_server(state: tauri::State<AppState>) {
-    *state.is_running.lock().unwrap() = false;
+    state.is_running.store(false, Ordering::Relaxed);
     // 重置连接状况，将连接者信息清楚
     state
         .exit_flag
@@ -53,11 +55,14 @@ fn stop_server(state: tauri::State<AppState>) {
     CLOSE_NOTIFY.notify_one();
 
     reset_cur_user();
+    reset_all_info();
     println!("[SERVER_INFO: Server stopped.");
 }
 
 #[tauri::command]
-fn get_server_info() -> (String, String, String, String, String, String) {
+fn get_server_info(
+    state: tauri::State<AppState>,
+) -> (String, String, String, String, String, String, bool) {
     let config = CONFIG.lock().unwrap();
     let uuid = UUID.lock().unwrap();
     println!(
@@ -65,7 +70,7 @@ fn get_server_info() -> (String, String, String, String, String, String) {
         config.server_address, config.connection_password, uuid
     );
     let cur_user = CURRENT_USER.lock().unwrap();
-
+    let is_running = state.is_running.clone();
     (
         config.server_address.clone(),
         config.connection_password.clone(),
@@ -73,6 +78,7 @@ fn get_server_info() -> (String, String, String, String, String, String) {
         cur_user.device_id.clone(),
         format!("{:?}", cur_user.user_type),
         uuid.clone(),
+        is_running.load(Ordering::Relaxed),
     )
 }
 
@@ -106,7 +112,7 @@ fn main() {
         //     Ok(())
         // })
         .manage(AppState {
-            is_running: Arc::new(Mutex::new(false)),
+            is_running: Arc::new(AtomicBool::new(false)),
             exit_flag: Arc::new(AtomicBool::new(false)),
         })
         .invoke_handler(tauri::generate_handler![

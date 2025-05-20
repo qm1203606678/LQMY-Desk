@@ -1,6 +1,6 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    sync::{atomic::AtomicBool, Arc},
+    time::Instant,
 };
 
 use actix_web::web;
@@ -12,7 +12,10 @@ use futures_util::{SinkExt, StreamExt};
 use lazy_static::lazy_static;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::Notify;
+use tokio::{
+    sync::Notify,
+    time::{self, Duration},
+};
 
 // 你的 payload 和消息结构
 #[derive(Debug, Deserialize)]
@@ -32,8 +35,10 @@ struct PayloadWithCmd {
 
 // auth.rs 里有定义
 use crate::{
-    client_utils::{auth::AuthRequest, password::generate_connection_password},
-    config::{update_uuid, CONFIG},
+    client_utils::{
+        auth::AuthRequest, dialog::show_iknow_dialog, password::generate_connection_password,
+    },
+    config::{update_uuid, CONFIG, UUID},
 };
 lazy_static! {
     pub static ref CLOSE_NOTIFY: Arc<Notify> = Arc::new(Notify::new());
@@ -52,13 +57,23 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
     // wrap the sink in an Arc<Mutex<>> so we can share it between tasks
     //let sink = Arc::new(Mutex::new(sink));
 
-    let register_json = json!({
-        "type": "register",
-        "client_type": "desktop"
-    });
-    connection
-        .send(Message::Text(register_json.to_string().into()))
-        .await?;
+    {
+        let register_json = json!({
+            "type": "register",
+            "client_type": "desktop"
+        });
+        connection
+            .send(Message::Text(register_json.to_string().into()))
+            .await?;
+    }
+    // ping消息的计时器，pong的超时检测
+    let mut interval = time::interval(Duration::from_secs(2));
+    // 上次心跳时间，由register_ack初始化
+    let mut last_heartbeat = Instant::now();
+    // pong 超时时间
+    const PONG_TIMEOUT: Duration = Duration::from_secs(6);
+    // 心跳检测的开关
+    let mut registered_flag = false;
     // --- 主动发送
     loop {
         tokio::select! {
@@ -69,6 +84,28 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                     connection.send(Message::Text(close_json.to_string().into())).await?;
                     // 继续等服务器发协议层的 Close 帧，或者直接 break 结束
                     break;
+                }
+                // ping信息
+                _=interval.tick()=>{
+                    if registered_flag
+                    {
+                        println!("[CLIENT] Ping");
+                        let uuid=UUID.lock().unwrap().clone();
+                        let ping_json=json!({
+                            "type":"ping",
+                            "from":uuid
+                        });
+                        drop(uuid);
+                        connection.send(Message::Text(ping_json.to_string().into())).await?;
+                    }
+                    // heartbeat check
+                    let now = Instant::now();
+                    if now.duration_since(last_heartbeat)>PONG_TIMEOUT{
+                        show_iknow_dialog("服务器断开", "请检查本地网络，或更换服务器").await;
+                        println!("[CLIENT]pong超时，last{:?},check time{:?}",last_heartbeat,now);
+                        return Ok(());
+                    }
+
                 }
                 Some(Ok(frame)) = connection.next()=> {
                     // if exit_flag.load(Ordering::Relaxed) {
@@ -117,6 +154,9 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                                 match uuid {
                                     Some(id) => {
                                         update_uuid(id);
+                                        //更新heartbeat
+                                        last_heartbeat = Instant::now();
+                                        registered_flag=true;
                                     }
                                     None => {
                                         eprintln!("[CLIENT] 找不到 uuid 字段: {}", txt_str);
@@ -151,14 +191,14 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                                                     web::Json(auth_req),
                                                 )
                                                 .await;
-
+                                                let uuid=UUID.lock().unwrap().clone();
                                                 let reply = json!({
                                                     "type": "message",
                                                     "target_uuid": msg.from,
-                                                    "from":"123",
+                                                    "from":uuid,
                                                     "payload": result,
                                                 });
-
+                                                drop(uuid);
                                                 connection
                                                     .send(Message::Text(reply.to_string().into()))
                                                     .await?;
@@ -167,6 +207,10 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                                         _ => println!("[CLIENT] Unknown cmd: {}", p.cmd),
                                     }
                                 }
+                            }
+                            "pong"=>{
+                                last_heartbeat=Instant::now();
+                                println!("[CLIENT]pong!")
                             }
                             other => println!("[CLIENT] Unknown message type: {}", other),
                         }

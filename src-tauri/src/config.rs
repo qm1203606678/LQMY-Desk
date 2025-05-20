@@ -1,5 +1,5 @@
 use actix_web::web;
-use chrono::format::StrftimeItems;
+
 use lazy_static::lazy_static;
 use rand::{distr::Alphanumeric, Rng};
 use std::sync::Mutex;
@@ -34,7 +34,8 @@ lazy_static! {
     pub static ref JWT_KEY:Mutex<String>=Mutex::new(generate_jwt_key());
     // 标识jwt是本次启动生成的
     pub static ref THIS_TIME:Mutex<String>=Mutex::new(generate_jwt_key());
-    //已经移到user_manage.rs管理 pub static ref DEVICE_LIST: Mutex<HashMap<String, DeviceInfo>> = Mutex::new(HashMap::new());// 没有放到CONFIG，为了减少不必要的并发访问冲突
+    //已经移到user_manage.rs管理
+    //pub static ref DEVICE_LIST: Mutex<HashMap<String, DeviceInfo>> = Mutex::new(HashMap::new());// 没有放到CONFIG，为了减少不必要的并发访问冲突
     // 中转站分配的uuid
     pub static ref UUID:Mutex<String>=Mutex::new("尚未连接服务器".to_string());
     // websocket 客户端的连接，全局共享
@@ -93,4 +94,12 @@ pub fn update_server_addr(ipaddr: String) {
     let mut config = CONFIG.lock().unwrap();
     config.server_address = ipaddr;
     println!("[CLIENT]所连服务器信息改变为:{:?}", config.server_address);
+}
+
+pub fn reset_all_info() {
+    let mut config = CONFIG.lock().unwrap();
+    config.connection_password = "Uninitia".to_string();
+    let mut uuid = UUID.lock().unwrap();
+    *uuid = "尚未连接服务器".to_string();
+    println!("[CONFIG]口令与UUID重置")
 }
