@@ -2,8 +2,12 @@ use actix_web::web;
 
 use lazy_static::lazy_static;
 use rand::{distr::Alphanumeric, Rng};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Mutex, Arc};
 use std::{env, path::PathBuf};
+
+use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 
 use crate::client_utils::{
     auth::AuthRequest,
@@ -38,6 +42,10 @@ lazy_static! {
     //pub static ref DEVICE_LIST: Mutex<HashMap<String, DeviceInfo>> = Mutex::new(HashMap::new());// 没有放到CONFIG，为了减少不必要的并发访问冲突
     // 中转站分配的uuid
     pub static ref UUID:Mutex<String>=Mutex::new("尚未连接服务器".to_string());
+    // 全局 PeerConnection 存储：session_id -> PeerConnection
+    pub static ref PEER_CONNECTION: Mutex<HashMap<String, Arc<RTCPeerConnection>>> = Mutex::new(HashMap::new());
+    // 全局候选列表存储：session_id -> Vec<RTCIceCandidateInit>
+    pub static ref CANDIDATES: Mutex<HashMap<String, Vec<RTCIceCandidateInit>>> = Mutex::new(HashMap::new());
     // websocket 客户端的连接，全局共享
     //pub static ref WS_SENDER:Arc<Mutex<Option<awc::BoxedSocket>>>=Arc::new(Mutex::new(None));
 }

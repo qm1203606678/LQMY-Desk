@@ -22,6 +22,7 @@ use tokio::{
 struct ServerMessage {
     #[serde(rename = "type")]
     msg_type: String,
+    target_uuid:String,
     from: String,
     payload: Value,
 }
@@ -38,7 +39,7 @@ use crate::{
     client_utils::{
         auth::AuthRequest, dialog::show_iknow_dialog, password::generate_connection_password,
     },
-    config::{update_uuid, CONFIG, UUID},
+    config::{update_uuid, CONFIG, UUID}, webrtc::webrtc_connect::OfferRequest,
 };
 lazy_static! {
     pub static ref CLOSE_NOTIFY: Arc<Notify> = Arc::new(Notify::new());
@@ -202,8 +203,47 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                                                 connection
                                                     .send(Message::Text(reply.to_string().into()))
                                                     .await?;
+                                                println!("[CLIENT]认证返回：{:?}",reply)
                                             }
                                         }
+                                        "RTCoffer"=>{
+                                            if let Ok(offer_req)=
+                                                serde_json::from_value::<OfferRequest>(p.data.clone())
+                                            {
+                                                let res=crate::webrtc::webrtc_connect::handle_webrtc_offer(web::Json(offer_req)).await;
+                                                let uuid=UUID.lock().unwrap().clone();
+                                                let reply = json!({
+                                                    "type": "message",
+                                                    "target_uuid": msg.from,
+                                                    "from":uuid,
+                                                    "payload": res,
+                                                });
+                                                drop(uuid);
+                                                connection
+                                                    .send(Message::Text(reply.to_string().into()))
+                                                    .await?;
+                                                println!("[CLIENT]RTC返回Answear：{:?}",reply)
+                                            }
+                                        }
+                                        // "RTCoffer"=>{
+                                        //     if let Ok(offer_req)=
+                                        //         serde_json::from_value::<OfferRequest>(p.data.clone())
+                                        //     {
+                                        //         let res=crate::webrtc::webrtc_connect::handle_webrtc_offer(web::Json(offer_req)).await;
+                                        //         let uuid=UUID.lock().unwrap().clone();
+                                        //         let reply = json!({
+                                        //             "type": "message",
+                                        //             "target_uuid": msg.from,
+                                        //             "from":uuid,
+                                        //             "payload": res,
+                                        //         });
+                                        //         drop(uuid);
+                                        //         connection
+                                        //             .send(Message::Text(reply.to_string().into()))
+                                        //             .await?;
+                                        //         println!("[CLIENT]RTC返回Answear：{:?}",reply)
+                                        //     }
+                                        // }
                                         _ => println!("[CLIENT] Unknown cmd: {}", p.cmd),
                                     }
                                 }
