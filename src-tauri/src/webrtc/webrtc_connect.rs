@@ -11,8 +11,8 @@ use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
@@ -21,7 +21,6 @@ use crate::webrtc::videostream::start_webrtc_video_stream;
 
 #[derive(Deserialize)]
 pub struct OfferRequest {
-
     pub sdp: String,
     pub mode: String, // "low_latency", "balanced", "high_quality"
 }
@@ -40,6 +39,11 @@ pub struct CandidateRequest {
     pub sdp_mline_index: Option<u16>,
 }
 
+#[derive(Serialize)]
+pub struct CandidateReqResult {
+    pub status: String,
+    pub reason: String,
+}
 #[derive(Serialize)]
 pub struct CandidateResponse {
     pub candidates: Vec<RTCIceCandidateInit>,
@@ -98,7 +102,10 @@ pub async fn handle_webrtc_offer(offer: web::Json<OfferRequest>) -> AnswerRespon
     // 5. 添加视频轨，初始模式决定 fmtp line
     let (mime, fmt) = match offer.mode.as_str() {
         "low_latency" => ("video/VP8", "max-fr=30;max-fs=360"),
-        "high_quality" => ("video/H264", "profile-level-id=42e01f;level-asymmetry-allowed=1"),
+        "high_quality" => (
+            "video/H264",
+            "profile-level-id=42e01f;level-asymmetry-allowed=1",
+        ),
         _ => ("video/VP8", "max-fr=24;max-fs=480"), // balanced
     };
     let video_track = Arc::new(TrackLocalStaticSample::new(
@@ -115,7 +122,10 @@ pub async fn handle_webrtc_offer(offer: web::Json<OfferRequest>) -> AnswerRespon
 
     // 6. DataChannel 信令与重协商
     let dc = {
-        let init = RTCDataChannelInit { ordered: Some(true), ..Default::default() };
+        let init = RTCDataChannelInit {
+            ordered: Some(true),
+            ..Default::default()
+        };
         pc.create_data_channel("control", Some(init)).await.unwrap()
     };
     let dc_re = dc.clone();
@@ -132,7 +142,10 @@ pub async fn handle_webrtc_offer(offer: web::Json<OfferRequest>) -> AnswerRespon
                 tokio::spawn(async move {
                     let (mime, fmt) = match mode.as_str() {
                         "low_latency" => ("video/VP8", "max-fr=30;max-fs=360"),
-                        "high_quality" => ("video/H264", "profile-level-id=42e01f;level-asymmetry-allowed=1"),
+                        "high_quality" => (
+                            "video/H264",
+                            "profile-level-id=42e01f;level-asymmetry-allowed=1",
+                        ),
                         _ => ("video/VP8", "max-fr=24;max-fs=480"),
                     };
                     let new_track = Arc::new(TrackLocalStaticSample::new(
@@ -158,7 +171,10 @@ pub async fn handle_webrtc_offer(offer: web::Json<OfferRequest>) -> AnswerRespon
 
     // 7. 收集本地 ICE 候选
     let session_id = Uuid::new_v4().to_string();
-    CANDIDATES.lock().unwrap().insert(session_id.clone(), Vec::new());
+    CANDIDATES
+        .lock()
+        .unwrap()
+        .insert(session_id.clone(), Vec::new());
     {
         let sid = session_id.clone();
         pc.on_ice_candidate(Box::new(move |opt| {
@@ -197,7 +213,10 @@ pub async fn handle_webrtc_offer(offer: web::Json<OfferRequest>) -> AnswerRespon
     pc.set_local_description(answer.clone()).await.unwrap();
 
     // 10. 保存并返回
-    PEER_CONNECTION.lock().unwrap().insert(session_id.clone(), pc.clone());
+    PEER_CONNECTION
+        .lock()
+        .unwrap()
+        .insert(session_id.clone(), pc.clone());
     AnswerResponse {
         session_id,
         sdp: answer.sdp,
@@ -205,7 +224,7 @@ pub async fn handle_webrtc_offer(offer: web::Json<OfferRequest>) -> AnswerRespon
 }
 
 // 客户端上传远端 ICE 候选，直接返回结果字符串
-pub async fn handle_ice_candidate(req: web::Json<CandidateRequest>) -> String {
+pub async fn handle_ice_candidate(req: web::Json<CandidateRequest>) -> CandidateReqResult {
     if let Some(pc) = PEER_CONNECTION.lock().unwrap().get(&req.session_id) {
         let init = RTCIceCandidateInit {
             candidate: req.candidate.clone(),
@@ -214,9 +233,15 @@ pub async fn handle_ice_candidate(req: web::Json<CandidateRequest>) -> String {
             username_fragment: None,
         };
         pc.add_ice_candidate(init).await.unwrap();
-        "ICE 注入成功".into()
+        CandidateReqResult {
+            status: "success".into(),
+            reason: "ICE 注入成功".into(),
+        }
     } else {
-        "无效 session_id".into()
+        CandidateReqResult {
+            status: "success".into(),
+            reason: "无效 session_id".into(),
+        }
     }
 }
 
