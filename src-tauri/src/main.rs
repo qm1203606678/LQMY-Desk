@@ -101,7 +101,9 @@ async fn delete_userinfo(serial: String) {
 async fn update_server_addr(ipaddr: String) {
     config::update_server_addr(ipaddr)
 }
-fn main() {
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() {
     tauri::Builder::default()
         // .setup(|_app| {
         //     thread::spawn(|| {

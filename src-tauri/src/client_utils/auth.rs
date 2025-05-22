@@ -1,12 +1,14 @@
+use super::dialog::show_confirmation_dialog;
+use super::user_manager::UserType;
 use crate::client_utils::user_manager::{add_device, get_user_by_serial};
 use crate::config::{update_cur_user, CONFIG, CURRENT_USER, NO_CONNECTION_INDENTIFIER, THIS_TIME};
 use actix_web::{web, HttpResponse, Responder};
 use chrono;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-
-use super::dialog::show_confirmation_dialog;
-use super::user_manager::UserType;
+use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
@@ -28,6 +30,10 @@ pub struct AuthResponse {
     pub body: String,
 }
 
+lazy_static! {
+    /// 正在等待用户确认的 device_serial 集合
+    static ref CONFIRMING: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+}
 /// websocket连接,处理逻辑: 1.判断服务端是否空闲
 ///                        2.根据用户类别处理
 ///                             （1）黑名单：直接拒绝
@@ -75,12 +81,34 @@ pub async fn authenticate(info: web::Json<AuthRequest>) -> AuthResponse {
         Some(user) if user.user_type == UserType::Normal => {
             let stored_pw = CONFIG.lock().unwrap().connection_password.clone();
             if stored_pw == info.password {
+                // 添加至连接队列
+
+                {
+                    let mut confirming = CONFIRMING.lock().unwrap();
+                    if !confirming.insert(info.device_serial.clone()) {
+                        // 已经有一个对话框在等此 serial 的确认
+                        // 直接返回“pending”，不弹新框
+                        return AuthResponse {
+                            status: "202".into(),
+                            body: "请求已在处理，请稍后".into(),
+                        };
+                    }
+                }
                 let msg = format!(
                     "是否允许来自{:?}({:?})的连接？",
                     info.device_name.clone(),
                     info.device_serial.clone()
                 );
-                if show_confirmation_dialog("连接请求", &msg) {
+                let approved: bool =
+                    tokio::task::spawn_blocking(move || show_confirmation_dialog("连接请求", &msg))
+                        .await
+                        .expect("blocking task panicked");
+                // 从确认队列去除
+                {
+                    let mut confirming = CONFIRMING.lock().unwrap();
+                    confirming.remove(&info.device_serial);
+                }
+                if approved {
                     update_cur_user(&info, UserType::Normal);
                     let token = generate_jwt(&info.device_serial);
                     //HttpResponse::Ok().json(token)
@@ -107,12 +135,32 @@ pub async fn authenticate(info: web::Json<AuthRequest>) -> AuthResponse {
         _ => {
             let stored_pw = CONFIG.lock().unwrap().connection_password.clone();
             if stored_pw == info.password {
+                {
+                    let mut confirming = CONFIRMING.lock().unwrap();
+                    if !confirming.insert(info.device_serial.clone()) {
+                        // 已经有一个对话框在等此 serial 的确认
+                        // 直接返回“pending”，不弹新框
+                        return AuthResponse {
+                            status: "202".into(),
+                            body: "请求已在处理，请稍后".into(),
+                        };
+                    }
+                }
                 let msg = format!(
                     "是否允许来自{:?}({:?})的连接？",
                     info.device_name.clone(),
                     info.device_serial.clone()
                 );
-                if show_confirmation_dialog("连接请求", &msg) {
+                let approved: bool =
+                    tokio::task::spawn_blocking(move || show_confirmation_dialog("连接请求", &msg))
+                        .await
+                        .expect("blocking task panicked");
+                // 从确认队列去除
+                {
+                    let mut confirming = CONFIRMING.lock().unwrap();
+                    confirming.remove(&info.device_serial);
+                }
+                if approved {
                     update_cur_user(&info, UserType::Normal);
                     let token = generate_jwt(&info.device_serial);
                     add_device(&info.device_name, &info.device_serial).await;

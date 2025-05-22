@@ -1,5 +1,6 @@
 use std::{
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, Mutex},
+    thread,
     time::Instant,
 };
 
@@ -42,6 +43,8 @@ use crate::{
 };
 lazy_static! {
     pub static ref CLOSE_NOTIFY: Arc<Notify> = Arc::new(Notify::new());
+    pub static ref SEND_NOTIFY: Arc<Notify> = Arc::new(Notify::new());
+    pub static ref PENDING: Mutex<Vec<Value>> = Mutex::new(vec![]);
 }
 pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
     let server_ws = CONFIG.lock().unwrap().server_address.clone(); // ws:// 或 wss://
@@ -74,14 +77,32 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
     const PONG_TIMEOUT: Duration = Duration::from_secs(6);
     // 心跳检测的开关
     let mut registered_flag = false;
+    // 发送锁
+    let send_lock = Mutex::new("lock".to_string());
+
     // --- 主动发送
     loop {
         tokio::select! {
+                // 发送消息
+                _=SEND_NOTIFY.notified()=>{
+                    let mut pending=PENDING.lock().unwrap();
+                    while let Some(json) = pending.pop(){
+                        connection.send(Message::Text(json.to_string().into())).await?;
+                        println!("[CLIENT]发送消息:{:?}",json);
+
+                    }
+                    println!{"[CLIENT]pending应该为空{:?}",pending};
+                    drop(pending);
+
+
+                }
                 // 先检查退出
                 _ = CLOSE_NOTIFY.notified() => {
                     println!("[CLIENT] Exit requested, sending close JSON");
                     let close_json = json!({ "type": "close" });
+                    send_lock.lock();
                     connection.send(Message::Text(close_json.to_string().into())).await?;
+                    drop(send_lock.lock().unwrap());
                     // 继续等服务器发协议层的 Close 帧，或者直接 break 结束
                     break;
                 }
@@ -96,7 +117,9 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                             "from":uuid
                         });
                         drop(uuid);
+                        send_lock.lock();
                         connection.send(Message::Text(ping_json.to_string().into())).await?;
+                        drop(send_lock.lock().unwrap());
                     }
                     // heartbeat check
                     let now = Instant::now();
@@ -189,22 +212,31 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                                                 serde_json::from_str::<AuthRequest>(p.data.as_str().unwrap())
                                             {
                                                 println!("[message]payload value {:?}",auth_req);
-                                                let result = crate::client_utils::auth::authenticate(
-                                                    web::Json(auth_req),
-                                                )
-                                                .await;
-                                                let uuid=UUID.lock().unwrap().clone();
-                                                let reply = json!({
-                                                    "type": "message",
-                                                    "target_uuid": msg.from,
-                                                    "from":uuid,
-                                                    "payload": json!(result),
+                                                tokio::spawn(async move{
+                                                    let result =
+                                                        // 在这里弹出阻塞的 GUI 对话框，比如 rfd、native-dialog 等
+                                                        crate::client_utils::auth::authenticate(web::Json(auth_req))
+                                                    .await;
+                                                    let uuid=UUID.lock().unwrap().clone();
+                                                    let reply = json!({
+                                                        "type": "message",
+                                                        "target_uuid": msg.from,
+                                                        "from":uuid,
+                                                        "payload": json!(result),
+                                                    });
+                                                    drop(uuid);
+                                                    let mut pending=PENDING.lock().unwrap();
+                                                    pending.push(reply.clone());
+                                                    drop(pending);
+                                                    SEND_NOTIFY.notify_one();
+                                                    // send_lock.lock();
+                                                    // connection
+                                                    //     .send(Message::Text(reply.to_string().into()))
+                                                    //     .await;
+                                                    // drop(send_lock);
+                                                    println!("[CLIENT]认证返回：{:?}",reply)
                                                 });
-                                                drop(uuid);
-                                                connection
-                                                    .send(Message::Text(reply.to_string().into()))
-                                                    .await?;
-                                                println!("[CLIENT]认证返回：{:?}",reply)
+
                                             }
                                         }
                                         "RTCoffer"=>{
