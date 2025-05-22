@@ -239,30 +239,36 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
 
                                             }
                                         }
-                                        "RTCoffer"=>{
+                                        "offer"=>{
                                             if let Ok(offer_req)=
-                                                serde_json::from_value::<OfferRequest>(p.data.clone())
+                                                serde_json::from_str::<OfferRequest>(p.data.as_str().unwrap())
                                             {
+                                                tokio::spawn(async move{
                                                 let res=crate::webrtc::webrtc_connect::handle_webrtc_offer(web::Json(offer_req)).await;
                                                 let uuid=UUID.lock().unwrap().clone();
-                                                let payload=json!({"cmd":"RTCansear","value":res});
+                                                let payload=json!({"cmd":"answear","value":res});
                                                 let reply = json!({
                                                     "type": "message",
                                                     "target_uuid": msg.from,
                                                     "from":uuid,
-                                                    "payload": payload,
+                                                    "payload": json!(payload),
                                                 });
                                                 drop(uuid);
-                                                connection
-                                                    .send(Message::Text(reply.to_string().into()))
-                                                    .await?;
+
+                                                let mut pending=PENDING.lock().unwrap();
+                                                pending.push(reply.clone());
+                                                drop(pending);
+                                                SEND_NOTIFY.notify_one();
+
                                                 println!("[CLIENT]RTC返回Answear：{:?}",reply)
+                                                })
                                             }
                                         }
                                         "candidate"=>{
                                             if let Ok(candidate_req)=
-                                                serde_json::from_value::<CandidateRequest>(p.data.clone())
+                                                serde_json::from_str::<CandidateRequest>(p.data.as_str().unwrap())
                                             {
+                                                tokio::spawn(async move{
                                                 let res=crate::webrtc::webrtc_connect::handle_ice_candidate(web::Json(candidate_req)).await;
                                                 let uuid=UUID.lock().unwrap().clone();
                                                 let payload=json!({"cmd":"candiate","value":res});
@@ -270,15 +276,24 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                                                     "type": "message",
                                                     "target_uuid": msg.from,
                                                     "from":uuid,
-                                                    "payload": res,
+                                                    "payload": json!(res),
                                                 });
                                                 drop(uuid);
-                                                connection
-                                                    .send(Message::Text(reply.to_string().into()))
-                                                    .await?;
+
+                                                let mut pending=PENDING.lock().unwrap();
+                                                pending.push(reply.clone());
+                                                drop(pending);
+                                                SEND_NOTIFY.notify_one();
+
                                                 println!("[CLIENT]RTC返回Answear：{:?}",reply)
+                                                })
                                             }
                                         }
+                                        "disconnect"=>{
+                                            // if let Ok(disconnect_req)=
+                                            //     serde_json::from_str::<>
+                                        }
+
                                         _ => println!("[CLIENT] Unknown cmd: {}", p.cmd),
                                     }
                                 }
