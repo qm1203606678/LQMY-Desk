@@ -11,10 +11,12 @@ use std::sync::{
 };
 
 use client::CLOSE_NOTIFY;
-use client_utils::user_manager::{
-    delete_user, transfer_userinfo_to_vue, update_user_category, UserInfoString,
+use client_utils::{
+    current_user::CurUsersInfo,
+    disconnect::disconnect_cur_user_by_uuid,
+    user_manager::{delete_user, transfer_userinfo_to_vue, update_user_category, UserInfoString},
 };
-use config::{reset_all_info, reset_cur_user, CONFIG, CURRENT_USER, UUID};
+use config::{reset_all_info, CONFIG, CURRENT_USERS_INFO, UUID};
 
 //use actix_web::{web, App, HttpServer, HttpResponse};
 //use tauri::Manager;
@@ -37,7 +39,7 @@ fn start_server(state: tauri::State<AppState>) {
 
         is_running.store(false, Ordering::Relaxed);
         reset_all_info();
-        reset_cur_user();
+        //reset_cur_user();
     });
 }
 
@@ -54,31 +56,32 @@ fn stop_server(state: tauri::State<AppState>) {
     );
     CLOSE_NOTIFY.notify_one();
 
-    reset_cur_user();
+    //reset_cur_user();
+
     reset_all_info();
     println!("[SERVER_INFO: Server stopped.");
 }
 
 #[tauri::command]
-fn get_server_info(
-    state: tauri::State<AppState>,
-) -> (String, String, String, String, String, String, bool) {
+fn get_server_info(state: tauri::State<AppState>) -> (String, String, String, bool, CurUsersInfo) {
     let config = CONFIG.lock().unwrap();
     let uuid = UUID.lock().unwrap();
     println!(
         "[SERVER_INFO: Acquiring addr {:?} & password {:?} & uuid {:?}]",
         config.server_address, config.connection_password, uuid
     );
-    let cur_user = CURRENT_USER.lock().unwrap();
+    //let cur_user = CURRENT_USER.lock().unwrap();
+    let cur_users_info = CURRENT_USERS_INFO.lock().unwrap().clone();
     let is_running = state.is_running.clone();
     (
         config.server_address.clone(),
         config.connection_password.clone(),
-        cur_user.device_name.clone(),
-        cur_user.device_id.clone(),
-        format!("{:?}", cur_user.user_type),
+        // cur_user.device_name.clone(),
+        // cur_user.device_id.clone(),
+        // format!("{:?}", cur_user.user_type),
         uuid.clone(),
         is_running.load(Ordering::Relaxed),
+        cur_users_info,
     )
 }
 
@@ -102,6 +105,16 @@ async fn update_server_addr(ipaddr: String) {
     config::update_server_addr(ipaddr)
 }
 
+#[tauri::command]
+async fn disconnect_by_uuid(uuid: String) {
+    disconnect_cur_user_by_uuid(&uuid);
+}
+
+#[tauri::command]
+/// 本地函数,不会向对方发消息
+async fn revoke_control() {
+    CURRENT_USERS_INFO.lock().unwrap().revoke_control();
+}
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     tauri::Builder::default()
@@ -125,6 +138,8 @@ async fn main() {
             update_user_type,
             delete_userinfo,
             update_server_addr,
+            disconnect_by_uuid,
+            revoke_control,
         ])
         .run(tauri::generate_context!())
         .expect("Failed to run Tauri application");

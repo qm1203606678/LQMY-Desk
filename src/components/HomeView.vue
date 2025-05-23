@@ -17,21 +17,32 @@
 
         <div class="server-info">
             <h2>连接信息</h2>
-
             <p><strong>当前服务器IP 地址:</strong> {{ serverAddress || "未获取" }}</p>
             <p><strong>连接口令:</strong> {{ connectionPassword || "无" }}</p>
-            <p><strong>本机编号:</strong>{{ currentUuid }}</p>
-            <div class="user-info-card">
-                <h3>当前用户</h3>
-                <template v-if="currentUser.device_id !== '!@#$%^&*()'">
-                    <p><strong>设备名称:</strong> {{ currentUser.device_name }}</p>
-                    <p><strong>设备ID:</strong> {{ currentUser.device_id }}</p>
-                    <p><strong>用户类型:</strong> {{ currentUser.user_type }}</p>
-
-                </template>
-                <p v-else>当前无设备连接</p>
-            </div>
+            <p><strong>本机编号:</strong> {{ currentUuid }}</p>
             <button @click="fetchServerInfo">刷新服务器信息</button>
+        </div>
+
+        <div class="connectors-info">
+            <h2>连接用户</h2>
+            <div class="user-bars">
+                <div v-for="(user, idx) in orderedUsers" :key="user.device_id" class="user-bar"
+                    :class="{ controller: idx === 0 && pointer < max }">
+                    <div class="info">
+                        <span class="name">{{ user.device_name }}</span>
+                        <span class="id">{{ user.device_id }}</span>
+                        <span class="type">{{ user.user_type }}</span>
+                    </div>
+                    <div class="actions">
+                        <button class="btn disconnect" @click="disconnectUser(user)">
+                            断接
+                        </button>
+                        <button v-if="idx === 0 && pointer < max" class="btn revoke" @click="revokeControl(user)">
+                            取消控制
+                        </button>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 </template>
@@ -44,31 +55,59 @@ import { useServerStore } from "../stores/server";
 export default {
     setup() {
         const serverStore = useServerStore();
+
         const inputIp = ref("");
         const statusMessage = computed(() => (serverStore.isRunning ? "运行中" : "未启动"));
         const statusClass = computed(() => (serverStore.isRunning ? "running" : "stopped"));
 
-        let timerId = null;
+        // --- 新增：curUsersInfo 相关计算属性
+        const max = computed(() => serverStore.curUsersInfo.max);
+        const pointer = computed(() => serverStore.curUsersInfo.pointer);
+        const usersinfo = computed(() => serverStore.curUsersInfo.usersinfo || []);
 
-        serverStore.updateServerInfo = function (addr, pw, name, id, type, uuid, isRunning) {
-            serverStore.serverAddress = addr;
-            serverStore.connectionPassword = pw;
-            serverStore.currentUser.device_name = name;
-            serverStore.currentUser.device_id = id;
-            serverStore.currentUser.user_type = type;
-            serverStore.currentUuid = uuid
-            serverStore.isRunning = isRunning
+        // 按 pointer 提前排序
+        const orderedUsers = computed(() => {
+            const arr = usersinfo.value;
+            if (pointer.value < max.value && pointer.value < arr.length) {
+                const ctrl = arr[pointer.value];
+                return [ctrl, ...arr.filter((_, i) => i !== pointer.value)];
+            }
+            return arr;
+        });
+
+        // “断接” 操作
+        function disconnectUser(user) {
+            invoke('disconnect_by_uuid', { uuid: user.uuid });
+            console.log("断接用户：", user.uuid);
         }
 
+        // “取消控制” 操作
+        function revokeControl(user) {
+            // TODO: 调用 Tauri 后端命令，比如：
+            // invoke('revoke_control', { device_id: user.device_id });
+            console.log("取消控制：", user.device_id);
+        }
+
+        // --- 更新 store 的方法
+        serverStore.updateServerInfo = function (addr, pw, uuid, isRunning, usersinfo) {
+            serverStore.serverAddress = addr;
+            serverStore.connectionPassword = pw;
+            serverStore.currentUuid = uuid;
+            serverStore.isRunning = isRunning;
+            serverStore.curUsersInfo = usersinfo;
+        };
+
+        // --- RPC 调用
         async function fetchServerInfo() {
             try {
-                const [address, password, name, id, type, uuid, isRunning] = await invoke("get_server_info");
-                serverStore.updateServerInfo(address, password, name, id, type, uuid, isRunning);
+                const [address, password, uuid, isRunning, usersinfo] = await invoke(
+                    "get_server_info"
+                );
+                serverStore.updateServerInfo(address, password, uuid, isRunning, usersinfo);
             } catch (error) {
                 console.error("获取服务器信息失败:", error);
             }
         }
-
         async function startServer() {
             try {
                 await invoke("start_server");
@@ -78,7 +117,6 @@ export default {
                 console.error("启动服务器失败:", error);
             }
         }
-
         async function stopServer() {
             try {
                 await invoke("stop_server");
@@ -88,31 +126,22 @@ export default {
                 console.error("停止服务器失败:", error);
             }
         }
-
         async function confirmIp() {
             try {
-                if (serverStore.isRunning) {
-                    throw "请先断开当前服务"
-                }
+                if (serverStore.isRunning) throw "请先断开当前服务";
                 await invoke("update_server_addr", { ipaddr: inputIp.value });
-                //await saveIpToCache(inputIp.value); // 缓存 IP
                 console.log("服务器地址已更新为:", inputIp.value);
             } catch (error) {
                 console.error("更新服务器地址失败:", error);
-                alert("更新服务器地址失败:", error);
+                alert("更新服务器地址失败: " + error);
             }
         }
-        onMounted(async () => {
+
+        let timerId = null;
+        onMounted(() => {
             fetchServerInfo();
             timerId = setInterval(fetchServerInfo, 5000);
-            // try {
-            //     const response = await fetch("http://127.0.0.1:9876/health");
-            //     serverStore.isRunning = response.ok;
-            // } catch (error) {
-            //     serverStore.isRunning = false;
-            // }
         });
-
         onUnmounted(() => {
             clearInterval(timerId);
         });
@@ -127,13 +156,17 @@ export default {
             confirmIp,
             serverAddress: computed(() => serverStore.serverAddress),
             connectionPassword: computed(() => serverStore.connectionPassword),
-            currentUser: computed(() => serverStore.currentUser),
+            currentUuid: computed(() => serverStore.currentUuid),
             isRunning: computed(() => serverStore.isRunning),
-            currentUuid: computed(() => serverStore.currentUuid)
+            // --- 导出给模板使用
+            max,
+            pointer,
+            orderedUsers,
+            disconnectUser,
+            revokeControl,
         };
-    }
+    },
 };
-
 </script>
 
 <style scoped>
@@ -162,11 +195,131 @@ export default {
     font-size: 16px;
 }
 
-.user-info-card {
-    background: white;
-    padding: 15px;
+/* ---- 用户列表样式 ---- */
+.user-list {
+    background: #f9f9f9;
+    padding: 20px;
+    border-radius: 10px;
+    margin-top: 20px;
+}
+
+.title {
+    font-size: 1.4rem;
+    margin-bottom: 1rem;
+}
+
+.user-cards {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 1rem;
+}
+
+.user-card {
+    padding: 1rem;
+    border: 1px solid #ddd;
     border-radius: 8px;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-    margin: 15px 0;
+    background-color: #fff;
+    position: relative;
+}
+
+.user-card.controller {
+    border-color: #4caf50;
+    background-color: #e8f5e9;
+}
+
+.badge {
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    background-color: #4caf50;
+    color: white;
+    padding: 0.2rem 0.5rem;
+    font-size: 0.75rem;
+    border-radius: 12px;
+}
+
+.connectors-info {
+    margin-top: 2rem;
+}
+
+/* 整个列表容器 */
+.user-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+/* 每个用户的信息条 */
+.user-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    background-color: #fff;
+    border: 1px solid #ddd;
+    transition: background-color 0.2s, border-color 0.2s;
+}
+
+/* 控制中用户高亮 */
+.user-bar.controller {
+    border-color: #4caf50;
+    background-color: #e8f5e9;
+}
+
+/* 左侧显示信息 */
+.user-bar .info {
+    display: flex;
+    gap: 1.5rem;
+    font-size: 0.9rem;
+}
+
+.user-bar .info .name {
+    font-weight: 500;
+}
+
+.user-bar .info .id {
+    color: #666;
+}
+
+.user-bar .info .type {
+    font-style: italic;
+}
+
+/* 右侧按钮容器 */
+.user-bar .actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+/* 通用按钮样式 */
+.user-bar .btn {
+    padding: 0.3rem 0.6rem;
+    border: none;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+/* 断接按钮 */
+.user-bar .btn.disconnect {
+    background-color: #f44336;
+    color: #fff;
+}
+
+.user-bar .btn.disconnect:hover {
+    background-color: #d32f2f;
+}
+
+/* 取消控制按钮 */
+.user-bar .btn.revoke {
+    background-color: #ff9800;
+    color: #fff;
+}
+
+.user-bar .btn.revoke:hover {
+    background-color: #fb8c00;
 }
 </style>

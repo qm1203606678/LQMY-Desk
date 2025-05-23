@@ -1,0 +1,119 @@
+use serde::{Deserialize, Serialize};
+
+use crate::config::{CURRENT_USER, CURRENT_USERS_INFO};
+
+use super::user_manager::UserType;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CurUsersInfo {
+    max: usize,         // 默认最大连接数
+    pub pointer: usize, // 0..=max-1 表示有控制权的用户， 此外无意义
+
+    pub usersinfo: Vec<CurInfo>,
+}
+impl CurUsersInfo {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            pointer: max + 1,
+            usersinfo: Vec::<CurInfo>::new(),
+        }
+    }
+
+    /// 通过CurInfo来升级对应的用户为控制用户，但是这里没有检测是否已有控制用户
+    pub fn set_ptr_by_serial(&mut self, serial: &str) -> bool {
+        let mut pointer = 0;
+        for cur_info in self.usersinfo.iter() {
+            if *serial != cur_info.device_id {
+                pointer += 1;
+            } else {
+                break;
+            }
+        }
+        self.pointer = pointer;
+        pointer < self.usersinfo.len()
+    }
+
+    // /// 设置ptr为max，表示已经到连接上限了
+    // pub fn set_ptr_as_max(&mut self){
+    //     self.pointer=self.max;
+    // }
+
+    /// 添加新的连接用户信息
+    pub fn add_new_cur_user(&mut self, new_user: &CurInfo) {
+        if self.usersinfo.len() < self.max {
+            self.usersinfo.push(new_user.clone());
+            println!("[CONFIG]成功添加新的用户信息：{:?}", new_user)
+        } else {
+            println!("[CONFIG]失败添加新的用户信息：{:?}", new_user)
+        }
+    }
+
+    /// 重置信息
+    pub fn reset(&mut self) {
+        self.pointer = self.max;
+        self.usersinfo = Vec::new();
+    }
+
+    /// 序列号确认信息存在与否
+    pub fn lookup_by_serial(&self, serial: &str) -> bool {
+        let mut res = false;
+        for cur_info in self.usersinfo.iter() {
+            res |= (serial == cur_info.device_id);
+        }
+        res
+    }
+
+    /// 是否有空余
+    pub fn is_avail(&self) -> bool {
+        self.usersinfo.len() < self.max
+    }
+
+    /// 删除用户
+    pub fn delete_by_uuid(&mut self, uuid: &str) -> bool {
+        let mut target = 0;
+        for cur_info in self.usersinfo.iter() {
+            if cur_info.uuid != uuid {
+                target += 1;
+            } else {
+                break;
+            }
+        }
+        if target < self.usersinfo.len() {
+            let removed = self.usersinfo.swap_remove(target);
+            println!("[CURUSER]连接用户信息删除：{:?}", removed);
+            true
+        } else {
+            println!("[CURUSER]连接用户信息删除失败：{:?}", uuid);
+            false
+        }
+    }
+
+    /// 检查是否已经有控制对象
+    pub fn has_controller(&self) -> bool {
+        self.pointer < self.usersinfo.len()
+    }
+
+    /// 判断是不是控制对象
+    pub fn is_controller_by_uuid(&self, uuid: String) -> bool {
+        let curinfos = CURRENT_USERS_INFO.lock().unwrap();
+        let pointer = curinfos.pointer;
+        if pointer < curinfos.usersinfo.len() {
+            curinfos.usersinfo[pointer].uuid == uuid
+        } else {
+            false
+        }
+    }
+
+    pub fn revoke_control(&mut self) {
+        self.pointer = self.max
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CurInfo {
+    pub device_name: String,
+    pub device_id: String,
+    pub user_type: UserType,
+    pub uuid: String,
+}

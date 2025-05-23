@@ -9,6 +9,7 @@ use std::fs;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub enum UserType {
     Blacklist,
     Normal,

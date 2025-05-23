@@ -2,13 +2,15 @@ use actix_web::web;
 
 use lazy_static::lazy_static;
 use rand::{distr::Alphanumeric, Rng};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Mutex, Arc};
+use std::sync::{Arc, Mutex};
 use std::{env, path::PathBuf};
 
-use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::peer_connection::RTCPeerConnection;
 
+use crate::client_utils::current_user::CurUsersInfo;
 use crate::client_utils::{
     auth::AuthRequest,
     user_manager::{UserInfo, UserType},
@@ -33,6 +35,9 @@ lazy_static! {
         device_id:NO_CONNECTION_INDENTIFIER.to_string(),
         user_type:UserType::Normal
     });
+    // 当前连接用户信息向量
+    pub static ref CURRENT_USERS_INFO:Mutex<CurUsersInfo>=Mutex::new(CurUsersInfo::new(5));
+
     pub static ref APPDATA_PATH:Mutex<PathBuf>=Mutex::new(load_storage_path());
     // JWT加密密钥，每次启动不一样
     pub static ref JWT_KEY:Mutex<String>=Mutex::new(generate_jwt_key());
@@ -68,29 +73,29 @@ fn generate_jwt_key() -> String {
     password
 }
 
-pub fn update_cur_user(info: &web::Json<AuthRequest>, usertype: UserType) {
-    let mut cur_user = CURRENT_USER.lock().unwrap();
+// pub fn update_cur_user(info: &web::Json<AuthRequest>, usertype: UserType) {
+//     let mut cur_user = CURRENT_USER.lock().unwrap();
 
-    cur_user.device_id = info.device_serial.clone();
-    cur_user.device_name = info.device_name.clone();
-    cur_user.user_type = usertype;
-    println!(
-        "[SERVER_INFO]连接用户信息更新：设备名：{:?}，设备序列号：{:?}，用户类型：{:?}",
-        cur_user.device_name, cur_user.device_id, cur_user.user_type
-    );
-}
+//     cur_user.device_id = info.device_serial.clone();
+//     cur_user.device_name = info.device_name.clone();
+//     cur_user.user_type = usertype;
+//     println!(
+//         "[SERVER_INFO]连接用户信息更新：设备名：{:?}，设备序列号：{:?}，用户类型：{:?}",
+//         cur_user.device_name, cur_user.device_id, cur_user.user_type
+//     );
+// }
 
-pub fn reset_cur_user() {
-    let mut cur_user = CURRENT_USER.lock().unwrap();
+// pub fn reset_cur_user() {
+//     let mut cur_user = CURRENT_USER.lock().unwrap();
 
-    cur_user.device_id = NO_CONNECTION_INDENTIFIER.to_string();
-    cur_user.device_name = "".to_string();
-    cur_user.user_type = UserType::Normal;
-    println!(
-        "[SERVER_INFO]连接用户信息重置为：设备名：{:?}，设备序列号：{:?}，用户类型：{:?}",
-        cur_user.device_name, cur_user.device_id, cur_user.user_type
-    );
-}
+//     cur_user.device_id = NO_CONNECTION_INDENTIFIER.to_string();
+//     cur_user.device_name = "".to_string();
+//     cur_user.user_type = UserType::Normal;
+//     println!(
+//         "[SERVER_INFO]连接用户信息重置为：设备名：{:?}，设备序列号：{:?}，用户类型：{:?}",
+//         cur_user.device_name, cur_user.device_id, cur_user.user_type
+//     );
+// }
 
 pub fn update_uuid(uuid: &str) {
     let mut cur_uuid = UUID.lock().unwrap();
@@ -109,5 +114,12 @@ pub fn reset_all_info() {
     config.connection_password = "Uninitia".to_string();
     let mut uuid = UUID.lock().unwrap();
     *uuid = "尚未连接服务器".to_string();
-    println!("[CONFIG]口令与UUID重置")
+    CURRENT_USERS_INFO.lock().unwrap().reset();
+    println!("[CONFIG]口令、用户与UUID重置")
 }
+
+// pub fn add_to_cur_user_vec(new_user: &UserInfo) {
+//     let mut cur_users_info = CURRENT_USERS_INFO.lock().unwrap();
+//     cur_users_info.usersinfo.push(new_user.clone());
+//     println!("[CONFIG]添加新连接用户信息：{:?}", new_user)
+// }
