@@ -117,3 +117,20 @@ pub struct CurInfo {
     pub user_type: UserType,
     pub uuid: String,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct CrtlReq {
+    uuid: String,
+    device_serial: String,
+}
+#[derive(Debug, Serialize)]
+pub struct CrtlAns {
+    status: String,
+    body: String,
+}
+// pub async fn handle_control_request(controlreq: CrtlReq) -> CrtlAns {
+//     let curusers = CURRENT_USERS_INFO.lock().unwrap();
+//     if !curusers.has_controller() {
+//         curusers.set_ptr_by_serial(&controlreq.device_serial);
+//     }
+// }

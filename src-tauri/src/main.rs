@@ -4,6 +4,7 @@ mod client;
 mod client_utils;
 mod config;
 mod error;
+mod video_capturer;
 mod webrtc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},

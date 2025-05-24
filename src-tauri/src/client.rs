@@ -35,11 +35,13 @@ struct PayloadWithCmd {
 // auth.rs 里有定义
 use crate::{
     client_utils::{
-        auth::AuthRequest, dialog::show_iknow_dialog, disconnect::DisconnectReq,
+        auth::{validate_jwt, AuthRequest},
+        dialog::show_iknow_dialog,
+        disconnect::DisconnectReq,
         password::generate_connection_password,
     },
     config::{update_uuid, CONFIG, CURRENT_USERS_INFO, UUID},
-    webrtc::webrtc_connect::OfferRequest,
+    webrtc::webrtc_connect::{get_ice_candidates, JWTCandidateRequest, JWTOfferRequest},
 };
 lazy_static! {
     pub static ref CLOSE_NOTIFY: Arc<Notify> = Arc::new(Notify::new());
@@ -245,56 +247,84 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                                             }
                                         }
                                         "offer"=>{
-                                            if let Ok(offer_req)=
-                                                serde_json::from_str::<OfferRequest>(p.data.as_str().unwrap())
+                                            if let Ok(jwt_offer_req)=
+                                                serde_json::from_str::<JWTOfferRequest>(p.data.as_str().unwrap())
                                             {
+                                                println!("[message]payload value {:?}",jwt_offer_req);
+                                                if !validate_jwt(&jwt_offer_req.jwt){
+                                                    println!("[OFFER_HANDLER]来自{:?}的JWT验证失败",msg.from);
+                                                    break;
+                                                }
                                                 //println!("[message]payload value {:?}",offer_req);
                                                 tokio::spawn(async move{
-                                                    let res=crate::webrtc::webrtc_connect::handle_webrtc_offer(web::Json(offer_req)).await;
-                                                    let uuid=UUID.lock().unwrap().clone();
-                                                    let payload=json!({"cmd":"answear","value":res});
-                                                    let reply = json!({
-                                                        "type": "message",
-                                                        "target_uuid": msg.from,
-                                                        "from":uuid,
-                                                        "payload": json!(payload),
-                                                    });
-                                                    drop(uuid);
+                                                    let res=crate::webrtc::webrtc_connect::handle_webrtc_offer(&web::Json(jwt_offer_req)).await;
+                                                    {
+                                                        let uuid=UUID.lock().unwrap().clone();
 
-                                                    let mut pending=PENDING.lock().unwrap();
-                                                    pending.push(reply.clone());
-                                                    drop(pending);
-                                                    SEND_NOTIFY.notify_one();
+                                                        let payload=json!({"cmd":"answear","value":res});
+                                                        let reply = json!({
+                                                            "type": "message",
+                                                            "target_uuid": msg.from,
+                                                            "from":uuid,
+                                                            "payload": json!(payload),
+                                                        });
+                                                        drop(uuid);
 
-                                                    println!("[CLIENT]RTC返回Answear：{:?}",reply);
+                                                        let mut pending=PENDING.lock().unwrap();
+                                                        pending.push(reply.clone());
+                                                        drop(pending);
+                                                        SEND_NOTIFY.notify_one();
+                                                        println!("[CLIENT]RTC返回Answear：{:?}",reply);
+                                                    }
+                                                    // 发送ICE
+                                                    // let uuid=UUID.lock().unwrap().clone();
+                                                    // let res=get_ice_candidates(&msg.from).await;
+                                                    // let payload=json!({"cmd":"answear","value":res});
+                                                    // let reply = json!({
+                                                    //     "type": "message",
+                                                    //     "target_uuid": msg.from,
+                                                    //     "from":uuid,
+                                                    //     "payload": json!(payload),
+                                                    // });
+                                                    // drop(uuid);
+
+                                                    // let mut pending=PENDING.lock().unwrap();
+                                                    // pending.push(reply.clone());
+                                                    // drop(pending);
+                                                    // SEND_NOTIFY.notify_one();
+                                                    // println!("[CLIENT]RTC返回ICE：{:?}",reply);
                                                 });
 
+                                            }else {
+                                                println!("[CLIENT]OFFER解析失败")
                                             }
                                         }
                                         "candidate"=>{
-                                            // if let Ok(candidate_req)=
-                                            //     serde_json::from_str::<CandidateRequest>(p.data.as_str().unwrap())
-                                            // {
-                                            //     tokio::spawn(async move{
-                                            //     let res=crate::webrtc::webrtc_connect::handle_ice_candidate(web::Json(candidate_req)).await;
-                                            //     let uuid=UUID.lock().unwrap().clone();
-                                            //     let payload=json!({"cmd":"candiate","value":res});
-                                            //     let reply = json!({
-                                            //         "type": "message",
-                                            //         "target_uuid": msg.from,
-                                            //         "from":uuid,
-                                            //         "payload": json!(res),
-                                            //     });
-                                            //     drop(uuid);
+                                            if let Ok(candidate_req)=
+                                                serde_json::from_str::<JWTCandidateRequest>(p.data.as_str().unwrap())
+                                            {
+                                                if !validate_jwt(&candidate_req.jwt){
+                                                    println!("[CNADIDATE_HANDLER]来自{:?}的JWT验证失败",msg.from);
+                                                    break;
+                                                }
+                                                let res=crate::webrtc::webrtc_connect::handle_ice_candidate(&web::Json(candidate_req)).await;
+                                                // let uuid=UUID.lock().unwrap().clone();
+                                                // let payload=json!({"cmd":"candiate","value":res});
+                                                // let reply = json!({
+                                                //     "type": "message",
+                                                //     "target_uuid": msg.from,
+                                                //     "from":uuid,
+                                                //     "payload": json!(res),
+                                                // });
+                                                // drop(uuid);
 
-                                            //     let mut pending=PENDING.lock().unwrap();
-                                            //     pending.push(reply.clone());
-                                            //     drop(pending);
-                                            //     SEND_NOTIFY.notify_one();
+                                                // let mut pending=PENDING.lock().unwrap();
+                                                // pending.push(reply.clone());
+                                                // drop(pending);
+                                                // SEND_NOTIFY.notify_one();
 
-                                            //     println!("[CLIENT]RTC返回Answear：{:?}",reply)
-                                            //     });
-                                            // }
+                                                println!("[CLIENT]接受对方Candidate：{:?}",res);
+                                            }
                                         }
                                         "disconnect"=>{
                                              if let Ok(disconnect_req)=
@@ -313,6 +343,9 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                                                         };
                                                     });
                                                 }
+                                        }
+                                        "control"=>{
+
                                         }
 
                                         _ => println!("[CLIENT] Unknown cmd: {}", p.cmd),

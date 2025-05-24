@@ -1,49 +1,59 @@
+use crate::client::{PENDING, SEND_NOTIFY};
+use crate::config::{CANDIDATES, PEER_CONNECTION, UUID};
+use crate::video_capturer::ffmpeg::start_screen_capture;
+use crate::webrtc::videostream::start_webrtc_video_stream_on_pc;
 use actix_web::web;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
-use uuid::Uuid;
-
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
+use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-use crate::config::{CANDIDATES, PEER_CONNECTION};
-use crate::webrtc::videostream::start_webrtc_video_stream;
+// #[derive(Deserialize)]
+// pub struct OfferRequest {
+//     pub client_uuid: String,
+//     pub sdp: String,
+//     pub mode: String, // "low_latency", "balanced", "high_quality"
+// }
 
-#[derive(Deserialize)]
-pub struct OfferRequest {
+#[derive(Debug, Deserialize)]
+pub struct JWTOfferRequest {
+    pub client_uuid: String,
     pub sdp: String,
     pub mode: String, // "low_latency", "balanced", "high_quality"
+    pub jwt: String,
 }
 
 #[derive(Serialize)]
 pub struct AnswerResponse {
-    pub session_id: String,
+    pub client_uuid: String,
     pub sdp: String,
 }
 
+// #[derive(Deserialize)]
+// pub struct CandidateRequest {
+//     pub client_uuid: String,
+//     pub candidate: String,
+//     pub sdp_mid: Option<String>,
+//     pub sdp_mline_index: Option<u16>,
+// }
 #[derive(Deserialize)]
-pub struct CandidateRequest {
-    pub session_id: String,
+pub struct JWTCandidateRequest {
+    pub client_uuid: String,
     pub candidate: String,
     pub sdp_mid: Option<String>,
     pub sdp_mline_index: Option<u16>,
+    pub jwt: String,
 }
 
-#[derive(Serialize)]
-pub struct CandidateReqResult {
-    pub status: String,
-    pub reason: String,
-}
 #[derive(Serialize)]
 pub struct CandidateResponse {
     pub candidates: Vec<RTCIceCandidateInit>,
@@ -56,25 +66,39 @@ struct ControlCmd {
 }
 
 // 初始 Offer/Answer，返回 AnswerResponse
-pub async fn handle_webrtc_offer(offer: web::Json<OfferRequest>) -> AnswerResponse {
+pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerResponse {
+    println!("[WEBRTC]准备启动");
+    let client_uuid = &offer.client_uuid;
+
     // 1. 初始化 MediaEngine 并注册 codecs
     let mut m = MediaEngine::default();
     if let Err(e) = m.register_default_codecs() {
         let msg = format!("MediaEngine 注册失败: {:?}", e);
         return AnswerResponse {
-            session_id: "0".into(),
+            client_uuid: client_uuid.clone(),
             sdp: msg,
         };
     }
     let api = APIBuilder::new().with_media_engine(m).build();
 
     // 2. 创建 PeerConnection
-    let pc = match api.new_peer_connection(RTCConfiguration::default()).await {
+    let config = RTCConfiguration {
+        ice_servers: vec![RTCIceServer {
+            urls: vec![
+                "stun:stun.l.google.com:19302".into(),
+                "stun:stun.qq.com:3478".into(),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    //let pc = api.new_peer_connection(config).await?;
+    let pc = match api.new_peer_connection(config).await {
         Ok(pc) => Arc::new(pc),
         Err(e) => {
             let msg = format!("PeerConnection 创建失败: {:?}", e);
             return AnswerResponse {
-                session_id: "0".into(),
+                client_uuid: client_uuid.clone(),
                 sdp: msg,
             };
         }
@@ -170,13 +194,12 @@ pub async fn handle_webrtc_offer(offer: web::Json<OfferRequest>) -> AnswerRespon
     }));
 
     // 7. 收集本地 ICE 候选
-    let session_id = Uuid::new_v4().to_string();
     CANDIDATES
         .lock()
         .unwrap()
-        .insert(session_id.clone(), Vec::new());
+        .insert(client_uuid.clone(), Vec::new());
     {
-        let sid = session_id.clone();
+        let uuid = client_uuid.clone();
         pc.on_ice_candidate(Box::new(move |opt| {
             if let Some(c) = opt {
                 if let Ok(json) = c.to_json() {
@@ -186,20 +209,60 @@ pub async fn handle_webrtc_offer(offer: web::Json<OfferRequest>) -> AnswerRespon
                         sdp_mline_index: json.sdp_mline_index,
                         username_fragment: None,
                     };
-                    CANDIDATES.lock().unwrap().get_mut(&sid).unwrap().push(init);
+                    CANDIDATES
+                        .lock()
+                        .unwrap()
+                        .get_mut(&uuid)
+                        .unwrap()
+                        .push(init);
                 }
+            } else {
+                println!("[WEBRTC] ICE gathering complete for client {}", uuid);
+                // 在候选列表末尾加一个 "end" 标志（空字符串）
+                CANDIDATES
+                    .lock()
+                    .unwrap()
+                    .get_mut(&uuid)
+                    .unwrap()
+                    .push(RTCIceCandidateInit {
+                        candidate: "".to_string(),
+                        sdp_mid: None,
+                        sdp_mline_index: None,
+                        username_fragment: None,
+                    });
+                // 这时发送ICE给另一端
+                let my_uuid = UUID.lock().unwrap().clone();
+                let res = get_ice_candidates(&uuid);
+                let payload = json!({"cmd":"answear","value":res});
+                let reply = json!({
+                    "type": "message",
+                    "target_uuid": uuid,
+                    "from":my_uuid,
+                    "payload": json!(payload),
+                });
+                drop(my_uuid);
+
+                let mut pending = PENDING.lock().unwrap();
+                pending.push(reply.clone());
+                drop(pending);
+                SEND_NOTIFY.notify_one();
+                println!("[CLIENT]RTC返回ICE：{:?}", reply);
             }
             Box::pin(async {})
         }));
     }
 
-    // 8. 推流时机：ICE Connected
+    // 8. ICE 连接成功后推流
     {
         let pc2 = pc.clone();
         pc.on_ice_connection_state_change(Box::new(move |state| {
             if state == RTCIceConnectionState::Connected {
+                tokio::task::spawn_blocking(|| start_screen_capture());
+                let pc_inner = pc2.clone();
                 tokio::spawn(async move {
-                    let _ = start_webrtc_video_stream(5004).await;
+                    if let Err(err) = start_webrtc_video_stream_on_pc(pc_inner, 5004).await {
+                        eprintln!("[WEBRTC] 推流失败: {:?}", err);
+                    }
                 });
             }
             Box::pin(async {})
@@ -216,16 +279,16 @@ pub async fn handle_webrtc_offer(offer: web::Json<OfferRequest>) -> AnswerRespon
     PEER_CONNECTION
         .lock()
         .unwrap()
-        .insert(session_id.clone(), pc.clone());
+        .insert(client_uuid.clone(), pc.clone());
     AnswerResponse {
-        session_id,
+        client_uuid: client_uuid.clone(),
         sdp: answer.sdp,
     }
 }
 
 // 客户端上传远端 ICE 候选，直接返回结果字符串
-pub async fn handle_ice_candidate(req: web::Json<CandidateRequest>) -> CandidateReqResult {
-    if let Some(pc) = PEER_CONNECTION.lock().unwrap().get(&req.session_id) {
+pub async fn handle_ice_candidate(req: &web::Json<JWTCandidateRequest>) -> String {
+    if let Some(pc) = PEER_CONNECTION.lock().unwrap().get(&req.client_uuid) {
         let init = RTCIceCandidateInit {
             candidate: req.candidate.clone(),
             sdp_mid: req.sdp_mid.clone(),
@@ -233,26 +296,22 @@ pub async fn handle_ice_candidate(req: web::Json<CandidateRequest>) -> Candidate
             username_fragment: None,
         };
         pc.add_ice_candidate(init).await.unwrap();
-        CandidateReqResult {
-            status: "success".into(),
-            reason: "ICE 注入成功".into(),
-        }
+        "ICE 注入成功".into()
     } else {
-        CandidateReqResult {
-            status: "success".into(),
-            reason: "无效 session_id".into(),
-        }
+        "无效 client_uuid".into()
     }
 }
 
 // 客户端拉取本地 ICE 候选，直接返回 CandidateResponse
-pub async fn get_ice_candidates(info: web::Query<HashMap<String, String>>) -> CandidateResponse {
-    let session_id = info.get("session_id").cloned().unwrap_or_default();
-    let cands = CANDIDATES
-        .lock()
-        .unwrap()
-        .get(&session_id)
-        .cloned()
-        .unwrap_or_default();
+pub fn get_ice_candidates(uuid: &str) -> CandidateResponse {
+    //let client_uuid = info.get("client_uuid").cloned().unwrap_or_default();
+    // let res = CANDIDATES
+    //     .lock()
+    //     .unwrap()
+    //     .get(uuid)
+    //     .cloned()
+    //     .unwrap_or_default();
+    let mut lock = CANDIDATES.lock().unwrap();
+    let cands = lock.remove(uuid).unwrap_or_default();
     CandidateResponse { candidates: cands }
 }
