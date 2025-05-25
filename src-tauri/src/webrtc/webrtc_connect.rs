@@ -1,28 +1,34 @@
 use crate::client::{PENDING, SEND_NOTIFY};
-use crate::config::{CANDIDATES, PEER_CONNECTION, UUID};
-use crate::video_capturer::ffmpeg::start_screen_capture;
-use crate::webrtc::videostream::start_webrtc_video_stream_on_pc;
+use crate::config::{APPDATA_PATH, PEER_CONNECTION, UUID};
+use crate::video_capturer::ffmpeg::{start_screen_capture, FFMPEG_CHILD};
+
 use actix_web::web;
+use bytes::Bytes;
+
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UdpSocket;
+use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use webrtc::track::track_local::TrackLocalWriter;
+
+use webrtc::data_channel::RTCDataChannel;
+
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
+
 use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
-
-// #[derive(Deserialize)]
-// pub struct OfferRequest {
-//     pub client_uuid: String,
-//     pub sdp: String,
-//     pub mode: String, // "low_latency", "balanced", "high_quality"
-// }
 
 #[derive(Debug, Deserialize)]
 pub struct JWTOfferRequest {
@@ -38,13 +44,6 @@ pub struct AnswerResponse {
     pub sdp: String,
 }
 
-// #[derive(Deserialize)]
-// pub struct CandidateRequest {
-//     pub client_uuid: String,
-//     pub candidate: String,
-//     pub sdp_mid: Option<String>,
-//     pub sdp_mline_index: Option<u16>,
-// }
 #[derive(Deserialize)]
 pub struct JWTCandidateRequest {
     pub client_uuid: String,
@@ -56,7 +55,7 @@ pub struct JWTCandidateRequest {
 
 #[derive(Serialize)]
 pub struct CandidateResponse {
-    pub candidates: Vec<RTCIceCandidateInit>,
+    pub candidates: RTCIceCandidateInit,
 }
 
 #[derive(Deserialize)]
@@ -111,93 +110,94 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
     }));
 
     // 4. 添加音轨（Opus）
-    let audio_track = Arc::new(TrackLocalStaticSample::new(
-        RTCRtpCodecCapability {
-            mime_type: "audio/opus".into(),
-            clock_rate: 48000,
-            channels: 2,
-            ..Default::default()
-        },
-        "audio".into(),
-        "rust-audio".into(),
-    ));
-    let _ = pc.add_track(audio_track).await;
+    // let audio_track = Arc::new(TrackLocalStaticSample::new(
+    //     RTCRtpCodecCapability {
+    //         mime_type: "audio/opus".into(),
+    //         clock_rate: 48000,
+    //         channels: 2,
+    //         ..Default::default()
+    //     },
+    //     "audio".into(),
+    //     "rust-audio".into(),
+    // ));
+    // let _ = pc.add_track(audio_track).await;
 
     // 5. 添加视频轨，初始模式决定 fmtp line
-    let (mime, fmt) = match offer.mode.as_str() {
-        "low_latency" => ("video/VP8", "max-fr=30;max-fs=360"),
-        "high_quality" => (
-            "video/H264",
-            "profile-level-id=42e01f;level-asymmetry-allowed=1",
-        ),
-        _ => ("video/VP8", "max-fr=24;max-fs=480"), // balanced
-    };
-    let video_track = Arc::new(TrackLocalStaticSample::new(
+
+    // let video_track = Arc::new(TrackLocalStaticSample::new(
+    //     RTCRtpCodecCapability {
+    //         mime_type: "video/H264".into(),
+    //         sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+    //             .into(),
+    //         clock_rate: 90000,
+    //         ..Default::default()
+    //     },
+    //     "video".into(),      // track ID
+    //     "rust-video".into(), // stream ID
+    // ));
+    let video_track = Arc::new(TrackLocalStaticRTP::new(
         RTCRtpCodecCapability {
-            mime_type: mime.into(),
-            sdp_fmtp_line: fmt.into(),
+            mime_type: "video/H264".into(),
+            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                .into(),
             clock_rate: 90000,
             ..Default::default()
         },
         "video".into(),
         "rust-video".into(),
     ));
-    let video_sender = pc.add_track(video_track.clone()).await.unwrap();
+    pc.add_track(video_track.clone()).await.unwrap();
 
-    // 6. DataChannel 信令与重协商
-    let dc = {
-        let init = RTCDataChannelInit {
-            ordered: Some(true),
-            ..Default::default()
-        };
-        pc.create_data_channel("control", Some(init)).await.unwrap()
-    };
-    let dc_re = dc.clone();
-    let pc_for_dc = pc.clone();
-    let video_sender_for_dc = video_sender.clone();
-    dc.on_message(Box::new(move |msg| {
-        let pc = pc_for_dc.clone();
-        let video_sender = video_sender_for_dc.clone();
-        let dc_inner = dc_re.clone();
-        let text = String::from_utf8_lossy(&msg.data).to_string();
-        if let Ok(cmd) = serde_json::from_str::<ControlCmd>(&text) {
-            if cmd.cmd == "switch_mode" {
-                let mode = cmd.mode.clone();
-                tokio::spawn(async move {
-                    let (mime, fmt) = match mode.as_str() {
-                        "low_latency" => ("video/VP8", "max-fr=30;max-fs=360"),
-                        "high_quality" => (
-                            "video/H264",
-                            "profile-level-id=42e01f;level-asymmetry-allowed=1",
-                        ),
-                        _ => ("video/VP8", "max-fr=24;max-fs=480"),
-                    };
-                    let new_track = Arc::new(TrackLocalStaticSample::new(
-                        RTCRtpCodecCapability {
-                            mime_type: mime.into(),
-                            sdp_fmtp_line: fmt.into(),
-                            clock_rate: 90000,
-                            ..Default::default()
-                        },
-                        "video".into(),
-                        "rust-video".into(),
-                    ));
-                    let _ = video_sender.replace_track(Some(new_track)).await;
-                    let offer = pc.create_offer(None).await.unwrap();
-                    pc.set_local_description(offer.clone()).await.unwrap();
-                    let msg_json = json!({ "cmd": "renegotiate", "sdp": offer.sdp });
-                    let _ = dc_inner.send_text(msg_json.to_string()).await;
-                });
-            }
-        }
-        Box::pin(async {})
-    }));
+    // // 6. DataChannel 信令与重协商
+    // 设置监听：对方创建的 DataChannel 到来时触发
+    // pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+    //     println!("[WEBRTC] 收到远端 DataChannel：label = {}", dc.label());
+
+    //     // 设置消息接收处理逻辑
+    //     dc.on_message(Box::new(move |msg| {
+    //         let data = &msg.data;
+
+    //         // 解析为字符串
+    //         if let Ok(text) = std::str::from_utf8(data) {
+    //             println!("[WEBRTC] 收到 DataChannel 消息文本: {}", text);
+
+    //             // 尝试解析 JSON
+    //             match serde_json::from_str::<Value>(text) {
+    //                 Ok(json) => {
+    //                     println!("[WEBRTC] JSON 内容：{}", json);
+
+    //                     // 你可以根据字段内容进行进一步处理
+    //                     if let Some(cmd) = json.get("cmd").and_then(|v| v.as_str()) {
+    //                         match cmd {
+    //                             "mouse_move" => {
+    //                                 println!("🖱️ 收到鼠标移动命令: {:?}", json);
+    //                                 // TODO: 处理 mouse_move
+    //                             }
+    //                             "keyboard_input" => {
+    //                                 println!("⌨️ 收到键盘输入命令: {:?}", json);
+    //                                 // TODO: 处理 keyboard_input
+    //                             }
+    //                             _ => {
+    //                                 println!("⚠️ 未知命令: {}", cmd);
+    //                             }
+    //                         }
+    //                     }
+    //                 }
+    //                 Err(e) => {
+    //                     eprintln!("❌ JSON 解析失败: {}", e);
+    //                 }
+    //             }
+    //         } else {
+    //             eprintln!("❌ 非 UTF-8 文本，无法处理");
+    //         }
+
+    //         Box::pin(async {})
+    //     }));
+
+    //     Box::pin(async {})
+    // }));
 
     // 7. 收集本地 ICE 候选
-    CANDIDATES
-        .lock()
-        .unwrap()
-        .insert(client_uuid.clone(), Vec::new());
     {
         let uuid = client_uuid.clone();
         pc.on_ice_candidate(Box::new(move |opt| {
@@ -209,44 +209,23 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
                         sdp_mline_index: json.sdp_mline_index,
                         username_fragment: None,
                     };
-                    CANDIDATES
-                        .lock()
-                        .unwrap()
-                        .get_mut(&uuid)
-                        .unwrap()
-                        .push(init);
-                }
-            } else {
-                println!("[WEBRTC] ICE gathering complete for client {}", uuid);
-                // 在候选列表末尾加一个 "end" 标志（空字符串）
-                CANDIDATES
-                    .lock()
-                    .unwrap()
-                    .get_mut(&uuid)
-                    .unwrap()
-                    .push(RTCIceCandidateInit {
-                        candidate: "".to_string(),
-                        sdp_mid: None,
-                        sdp_mline_index: None,
-                        username_fragment: None,
+                    let my_uuid = UUID.lock().unwrap().clone();
+                    let res = send_ice_candidate(init);
+                    let payload = json!({"cmd":"candidate","value":res});
+                    let reply = json!({
+                        "type": "message",
+                        "target_uuid": uuid,
+                        "from":my_uuid,
+                        "payload": json!(payload),
                     });
-                // 这时发送ICE给另一端
-                let my_uuid = UUID.lock().unwrap().clone();
-                let res = get_ice_candidates(&uuid);
-                let payload = json!({"cmd":"answear","value":res});
-                let reply = json!({
-                    "type": "message",
-                    "target_uuid": uuid,
-                    "from":my_uuid,
-                    "payload": json!(payload),
-                });
-                drop(my_uuid);
+                    drop(my_uuid);
 
-                let mut pending = PENDING.lock().unwrap();
-                pending.push(reply.clone());
-                drop(pending);
-                SEND_NOTIFY.notify_one();
-                println!("[CLIENT]RTC返回ICE：{:?}", reply);
+                    let mut pending = PENDING.lock().unwrap();
+                    pending.push(reply.clone());
+                    drop(pending);
+                    SEND_NOTIFY.notify_one();
+                    println!("[CLIENT]RTC返回ICE：{:?}", reply);
+                }
             }
             Box::pin(async {})
         }));
@@ -256,24 +235,79 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
     {
         let pc2 = pc.clone();
         pc.on_ice_connection_state_change(Box::new(move |state| {
-            if state == RTCIceConnectionState::Connected {
-                tokio::task::spawn_blocking(|| start_screen_capture());
-                let pc_inner = pc2.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = start_webrtc_video_stream_on_pc(pc_inner, 5004).await {
-                        eprintln!("[WEBRTC] 推流失败: {:?}", err);
-                    }
-                });
-            }
+            println!("[WEBRTC]连接状态改变，ICEState：{:?}", state);
+            monitor_video_send_stats(pc2.clone());
             Box::pin(async {})
         }));
     }
 
+    //let pc2 = pc.clone();
+
+    pc.on_peer_connection_state_change(Box::new(move |state| {
+        println!("[WEBRTC]连接状态改变，ConnectionState： {:?}", state);
+
+        if state == RTCPeerConnectionState::Connected {
+            println!("✅ DTLS 握手成功");
+            let video_track2 = video_track.clone();
+            // 5. 启动后台任务，不断读包并写入 RTP Track
+            tokio::task::spawn(async move {
+                let mut buf = vec![0u8; 1500];
+                let bind_addr: SocketAddr = format!("127.0.0.1:{}", 8765).parse().unwrap();
+                let socket = UdpSocket::bind(bind_addr).await.unwrap();
+                loop {
+                    if let Ok((size, _peer)) = socket.recv_from(&mut buf).await {
+                        let inner = &buf[..size];
+                        // file.write_all(&buf.clone()).await;
+                        // file.flush().await;
+                        // let sample = Sample {
+                        //     data: Bytes::copy_from_slice(nalu),
+                        //     duration: Duration::from_millis(33), // 30fps
+                        //     ..Default::default()
+                        // };
+
+                        if let Err(err) = video_track2.write(inner).await {
+                            eprintln!("[H264Sample] write_sample err: {}", err);
+                        }
+                    } else {
+                        println!("[VIDEOSTREAM]packet_buf{:?}", buf)
+                    }
+                }
+            });
+            // if let None = *FFMPEG_CHILD.lock().unwrap() {
+
+            // } else {
+            //     println!("[FFMPEG]已启动")
+            // }
+            start_screen_capture(8765);
+            println!("[VIDEOTRACK] 启动 UDP→WebRTC 推流 @{}", 8765);
+        }
+        // else {
+        //     let mut child_lock = FFMPEG_CHILD.lock().unwrap();
+
+        //     if let Some(child) = child_lock.as_mut() {
+        //         match child.kill() {
+        //             Ok(_) => {
+        //                 println!("FFmpeg 进程已成功终止");
+        //             }
+        //             Err(e) => {
+        //                 eprintln!("终止 FFmpeg 进程失败: {}", e);
+        //             }
+        //         }
+        //         // 等待子进程真正退出，回收资源
+        //         let _ = child.wait();
+        //     }
+
+        //     *child_lock = None;
+        // }
+        Box::pin(async {})
+    }));
     // 9. SDP Offer/Answer
     let remote = RTCSessionDescription::offer(offer.sdp.clone()).unwrap();
     pc.set_remote_description(remote).await.unwrap();
     let answer = pc.create_answer(None).await.unwrap();
-    pc.set_local_description(answer.clone()).await.unwrap();
+    if let Err(e) = pc.set_local_description(answer.clone()).await {
+        eprint!("[LOCAL DES]{:?}", e)
+    };
 
     // 10. 保存并返回
     PEER_CONNECTION
@@ -303,15 +337,58 @@ pub async fn handle_ice_candidate(req: &web::Json<JWTCandidateRequest>) -> Strin
 }
 
 // 客户端拉取本地 ICE 候选，直接返回 CandidateResponse
-pub fn get_ice_candidates(uuid: &str) -> CandidateResponse {
-    //let client_uuid = info.get("client_uuid").cloned().unwrap_or_default();
-    // let res = CANDIDATES
-    //     .lock()
-    //     .unwrap()
-    //     .get(uuid)
-    //     .cloned()
-    //     .unwrap_or_default();
-    let mut lock = CANDIDATES.lock().unwrap();
-    let cands = lock.remove(uuid).unwrap_or_default();
-    CandidateResponse { candidates: cands }
+// pub fn send_ice_candidate(uuid: &str) -> CandidateResponse {
+//     //let client_uuid = info.get("client_uuid").cloned().unwrap_or_default();
+//     // let res = CANDIDATES
+//     //     .lock()
+//     //     .unwrap()
+//     //     .get(uuid)
+//     //     .cloned()
+//     //     .unwrap_or_default();
+//     let mut lock = CANDIDATES.lock().unwrap();
+//     let cands = lock.remove(uuid).unwrap_or_default();
+//     CandidateResponse { candidates: cands }
+// }
+#[inline]
+pub fn send_ice_candidate(candi: RTCIceCandidateInit) -> CandidateResponse {
+    CandidateResponse { candidates: candi }
+}
+
+use tokio::time::{interval, Duration};
+use webrtc::peer_connection::RTCPeerConnection;
+
+pub fn monitor_video_send_stats(pc: Arc<RTCPeerConnection>) {
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+
+            // 直接获取统计报告
+            let report = pc.get_stats().await;
+            println!("{:?}", report.reports);
+            for (_id, stat) in report.reports {
+                if let Ok(json) = serde_json::to_value(&stat) {
+                    // 筛选出视频的发送统计
+                    if json.get("type") == Some(&Value::String("outbound-rtp".into()))
+                        && json.get("mediaType") == Some(&Value::String("video".into()))
+                    {
+                        let bytes_sent =
+                            json.get("bytesSent").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let packets_sent = json
+                            .get("packetsSent")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let frames_encoded = json
+                            .get("framesEncoded")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        println!(
+                            "[STATS] bytes_sent = {}, packets_sent = {}, frames_encoded = {}",
+                            bytes_sent, packets_sent, frames_encoded
+                        );
+                    }
+                }
+            }
+        }
+    });
 }

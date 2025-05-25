@@ -41,7 +41,7 @@ use crate::{
         password::generate_connection_password,
     },
     config::{update_uuid, CONFIG, CURRENT_USERS_INFO, UUID},
-    webrtc::webrtc_connect::{get_ice_candidates, JWTCandidateRequest, JWTOfferRequest},
+    webrtc::webrtc_connect::{send_ice_candidate, JWTCandidateRequest, JWTOfferRequest},
 };
 lazy_static! {
     pub static ref CLOSE_NOTIFY: Arc<Notify> = Arc::new(Notify::new());
