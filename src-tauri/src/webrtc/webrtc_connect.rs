@@ -12,10 +12,12 @@ use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::rtp::packet::Packet;
+use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::TrackLocalWriter;
-
-use webrtc::data_channel::RTCDataChannel;
+use webrtc::util::Unmarshal;
 
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
@@ -141,6 +143,24 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
             sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
                 .into(),
             clock_rate: 90000,
+            rtcp_feedback: vec![
+                RTCPFeedback {
+                    typ: "nack".to_owned(),
+                    parameter: "".to_owned(),
+                },
+                RTCPFeedback {
+                    typ: "nack".to_owned(),
+                    parameter: "pli".to_owned(), // picture loss indication
+                },
+                RTCPFeedback {
+                    typ: "goog-remb".to_owned(), // optional, for bandwidth estimation
+                    parameter: "".to_owned(),
+                },
+                RTCPFeedback {
+                    typ: "ccm".to_owned(),
+                    parameter: "fir".to_owned(),
+                },
+            ],
             ..Default::default()
         },
         "video".into(),
@@ -256,17 +276,20 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
                 let socket = UdpSocket::bind(bind_addr).await.unwrap();
                 loop {
                     if let Ok((size, _peer)) = socket.recv_from(&mut buf).await {
-                        let inner = &buf[..size];
-                        // file.write_all(&buf.clone()).await;
-                        // file.flush().await;
+                        //println!("[RTP]{:?}", buf[..12].to_vec());
+                        let mut inner = &buf[..size];
+                        // let mut packet = Packet::default();
+                        // let ppp = Packet::unmarshal(&mut inner).unwrap();
+                        // // 2. 取出纯 payload（H.264 NALU
+                        // let payload = ppp.payload;
+
                         // let sample = Sample {
-                        //     data: Bytes::copy_from_slice(nalu),
+                        //     data: Bytes::copy_from_slice(&payload),
                         //     duration: Duration::from_millis(33), // 30fps
                         //     ..Default::default()
                         // };
-
-                        if let Err(err) = video_track2.write(inner).await {
-                            eprintln!("[H264Sample] write_sample err: {}", err);
+                        if let Err(err) = video_track2.write(&inner).await {
+                            eprintln!("[H264Sample] write err: {}", err);
                         }
                     } else {
                         println!("[VIDEOSTREAM]packet_buf{:?}", buf)
