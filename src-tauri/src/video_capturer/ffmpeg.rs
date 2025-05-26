@@ -3,14 +3,21 @@ use std::{
     sync::Mutex,
 };
 
-use crate::config::APPDATA_PATH;
+use crate::config::{APPDATA_PATH, PEER_CONNECTION};
 use lazy_static::lazy_static;
+use sha2::digest::consts::False;
+use webrtc::peer_connection;
 lazy_static! {
     pub static ref FFMPEG_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 }
 
 // 你的 FFmpeg 启动函数
 pub fn start_screen_capture(udp_port: u16) {
+    let mut ffmpeg = FFMPEG_CHILD.lock().unwrap();
+    if ffmpeg.is_some() {
+        println!("ffmpeg 已启动");
+        return;
+    };
     println!("[FFMPEG]启动");
     let path = APPDATA_PATH.lock().unwrap().clone().join("ffmpeg.exe");
     let addr = format!("rtp://127.0.0.1:{}", udp_port);
@@ -62,6 +69,26 @@ pub fn start_screen_capture(udp_port: u16) {
         .spawn()
         .expect(&format!("启动 FFmpeg 失败,请检查路径{:?}", path));
 
-    let mut ffmpeg = FFMPEG_CHILD.lock().unwrap();
     *ffmpeg = Some(ffmpeg_child_process)
+}
+
+/// 关闭视频捕获，没有peerconnection就关
+pub fn end_screen_capture(force: bool) {
+    let pcs = PEER_CONNECTION.lock().unwrap();
+    if pcs.is_empty() || force {
+        let mut child_lock = FFMPEG_CHILD.lock().unwrap();
+        if let Some(child) = child_lock.as_mut() {
+            match child.kill() {
+                Ok(_) => {
+                    println!("FFmpeg 进程已成功终止");
+                }
+                Err(e) => {
+                    eprintln!("终止 FFmpeg 进程失败: {}", e);
+                }
+            }
+            // 等待子进程真正退出，回收资源
+            let _ = child.wait();
+        }
+        *child_lock = None;
+    }
 }

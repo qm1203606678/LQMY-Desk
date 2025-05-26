@@ -17,7 +17,9 @@ use client_utils::{
     disconnect::disconnect_cur_user_by_uuid,
     user_manager::{delete_user, transfer_userinfo_to_vue, update_user_category, UserInfoString},
 };
-use config::{reset_all_info, CONFIG, CURRENT_USERS_INFO, UUID};
+use config::{reset_all_info, CONFIG, CURRENT_USERS_INFO, PEER_CONNECTION, UUID};
+use video_capturer::ffmpeg::end_screen_capture;
+use webrtc::webrtc_connect::close_peerconnection;
 
 //use actix_web::{web, App, HttpServer, HttpResponse};
 //use tauri::Manager;
@@ -108,9 +110,35 @@ async fn update_server_addr(ipaddr: String) {
 
 #[tauri::command]
 async fn disconnect_by_uuid(uuid: String) {
+    close_peerconnection(&uuid).await;
     disconnect_cur_user_by_uuid(&uuid);
 }
+#[tauri::command]
+async fn backend_close_handler() {
+    // 1. 先收集所有连接的克隆
+    let connections_to_close = {
+        let pcs = PEER_CONNECTION.lock().unwrap();
+        pcs.iter()
+            .map(|(uuid, pc)| (uuid.clone(), pc.clone()))
+            .collect::<Vec<_>>()
+    }; // MutexGuard 在这里被释放
 
+    // 2. 逐个关闭连接
+    for (uuid, pc) in connections_to_close {
+        if let Err(e) = pc.close().await {
+            println!("[CLOSE]uuid:{:?}关闭失败，{:?}", uuid, e);
+        }
+    }
+
+    // 3. 清空 HashMap
+    {
+        let mut pcs = PEER_CONNECTION.lock().unwrap();
+        pcs.clear();
+    }
+
+    // 关闭录屏
+    end_screen_capture(true);
+}
 #[tauri::command]
 /// 本地函数,不会向对方发消息
 async fn revoke_control() {
@@ -119,13 +147,14 @@ async fn revoke_control() {
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     tauri::Builder::default()
-        // .setup(|_app| {
-        //     thread::spawn(|| {
-        //         if let Err(e) = block_on(start_client()) {
-        //             eprintln!("[CLIENT ERROR] {:?}", e);
+        // .on_window_event(|window, event| {
+        //     match event {
+        //         tauri::WindowEvent::CloseRequested { .. } => {
+        //             //backend_close_handler().await;
+        //             window.close();
         //         }
-        //     });
-        //     Ok(())
+        //         _ => {} //todo
+        //     }
         // })
         .manage(AppState {
             is_running: Arc::new(AtomicBool::new(false)),
@@ -141,6 +170,7 @@ async fn main() {
             update_server_addr,
             disconnect_by_uuid,
             revoke_control,
+            backend_close_handler,
         ])
         .run(tauri::generate_context!())
         .expect("Failed to run Tauri application");
