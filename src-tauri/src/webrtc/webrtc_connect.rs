@@ -1,5 +1,6 @@
 use crate::client::{PENDING, SEND_NOTIFY};
-use crate::config::{PEER_CONNECTION, UUID};
+use crate::config::{GLOBAL_STREAM_MANAGER, PEER_CONNECTION, UUID};
+use crate::video_capturer::assembly::QualityConfig;
 use crate::video_capturer::ffmpeg::{end_screen_capture, start_screen_capture};
 
 use actix_web::web;
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use tokio::net::UdpSocket;
 use webrtc::data_channel::RTCDataChannel;
@@ -114,6 +116,7 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
     //         mime_type: "audio/opus".into(),
     //         clock_rate: 48000,
     //         channels: 2,
+
     //         ..Default::default()
     //     },
     //     "audio".into(),
@@ -123,18 +126,7 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
 
     // 5. 添加视频轨，初始模式决定 fmtp line
 
-    // let video_track = Arc::new(TrackLocalStaticSample::new(
-    //     RTCRtpCodecCapability {
-    //         mime_type: "video/H264".into(),
-    //         sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-    //             .into(),
-    //         clock_rate: 90000,
-    //         ..Default::default()
-    //     },
-    //     "video".into(),      // track ID
-    //     "rust-video".into(), // stream ID
-    // ));
-    let video_track = Arc::new(TrackLocalStaticRTP::new(
+    let video_track = Arc::new(TrackLocalStaticSample::new(
         RTCRtpCodecCapability {
             mime_type: "video/H264".into(),
             sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
@@ -160,9 +152,38 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
             ],
             ..Default::default()
         },
-        "video".into(),
-        "rust-video".into(),
+        "video".into(),      // track ID
+        "rust-video".into(), // stream ID
     ));
+    // let video_track = Arc::new(TrackLocalStaticRTP::new(
+    //     RTCRtpCodecCapability {
+    //         mime_type: "video/H264".into(),
+    //         sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+    //             .into(),
+    //         clock_rate: 90000,
+    //         rtcp_feedback: vec![
+    //             RTCPFeedback {
+    //                 typ: "nack".to_owned(),
+    //                 parameter: "".to_owned(),
+    //             },
+    //             RTCPFeedback {
+    //                 typ: "nack".to_owned(),
+    //                 parameter: "pli".to_owned(), // picture loss indication
+    //             },
+    //             RTCPFeedback {
+    //                 typ: "goog-remb".to_owned(), // optional, for bandwidth estimation
+    //                 parameter: "".to_owned(),
+    //             },
+    //             RTCPFeedback {
+    //                 typ: "ccm".to_owned(),
+    //                 parameter: "fir".to_owned(),
+    //             },
+    //         ],
+    //         ..Default::default()
+    //     },
+    //     "video".into(),
+    //     "rust-video".into(),
+    // ));
     pc.add_track(video_track.clone()).await.unwrap();
 
     // // 6. DataChannel 信令与重协商
@@ -267,30 +288,44 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
             if state == RTCPeerConnectionState::Connected {
                 println!("✅ DTLS 握手成功");
                 let video_track2 = video_track.clone();
-                // 5. 启动后台任务，不断读包并写入 RTP Track
                 tokio::task::spawn(async move {
-                    let mut buf = vec![0u8; 1500];
-                    let bind_addr: SocketAddr = format!("127.0.0.1:{}", 8765).parse().unwrap();
-                    let socket = UdpSocket::bind(bind_addr).await.unwrap();
-                    loop {
-                        if let Ok((size, _peer)) = socket.recv_from(&mut buf).await {
-                            //println!("[RTP]{:?}", buf[..12].to_vec());
-                            let mut inner = &buf[..size];
-                            if let Err(err) = video_track2.write(&inner).await {
-                                eprintln!("[H264Sample] write err: {}", err);
-                            }
-                        } else {
-                            println!("[VIDEOSTREAM]packet_buf{:?}", buf)
-                        }
-                    }
+                    // 5. 启动后台任务，不断读包并写入 RTP Track
+                    GLOBAL_STREAM_MANAGER.start_capture();
+                    let q = QualityConfig {
+                        name: "480p".to_string(),
+                        width: 854,
+                        height: 480,
+                        bitrate: 500000,
+                        fps: 24,
+                    };
+                    GLOBAL_STREAM_MANAGER.add_quality_stream(q).await;
+                    GLOBAL_STREAM_MANAGER
+                        .create_track_writer("480p", video_track2)
+                        .await;
                 });
-                // if let None = *FFMPEG_CHILD.lock().unwrap() {
+                // tokio::task::spawn(async move {
+                //     let mut buf = vec![0u8; 1500];
+                //     let bind_addr: SocketAddr = format!("127.0.0.1:{}", 8765).parse().unwrap();
+                //     let socket = UdpSocket::bind(bind_addr).await.unwrap();
+                //     loop {
+                //         if let Ok((size, _peer)) = socket.recv_from(&mut buf).await {
+                //             //println!("[RTP]{:?}", buf[..12].to_vec());
+                //             let mut inner = &buf[..size];
+                //             if let Err(err) = video_track2.write(&inner).await {
+                //                 eprintln!("[H264Sample] write err: {}", err);
+                //             }
+                //         } else {
+                //             println!("[VIDEOSTREAM]packet_buf{:?}", buf)
+                //         }
+                //     }
+                // });
+                // // if let None = *FFMPEG_CHILD.lock().unwrap() {
 
-                // } else {
-                //     println!("[FFMPEG]已启动")
-                // }
-                start_screen_capture(8765);
-                println!("[VIDEOTRACK] 启动 UDP→WebRTC 推流 @{}", 8765);
+                // // } else {
+                // //     println!("[FFMPEG]已启动")
+                // // }
+                // start_screen_capture(8765);
+                // println!("[VIDEOTRACK] 启动 UDP→WebRTC 推流 @{}", 8765);
             } else if state == RTCPeerConnectionState::Closed {
                 let pc3 = pc2.clone();
                 let client_uuid3 = client_uuid2.clone();

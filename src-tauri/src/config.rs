@@ -15,7 +15,7 @@ use crate::client_utils::{
     auth::AuthRequest,
     user_manager::{UserInfo, UserType},
 };
-
+use crate::video_capturer::assembly::MultiStreamManager;
 pub const NO_CONNECTION_INDENTIFIER: &str = "!@#$%^&*()";
 // 存储全局信息的结构体
 pub struct Config {
@@ -53,8 +53,12 @@ lazy_static! {
     pub static ref CANDIDATES: Mutex<HashMap<String, Vec<RTCIceCandidateInit>>> = Mutex::new(HashMap::new());
     // websocket 客户端的连接，全局共享
     //pub static ref WS_SENDER:Arc<Mutex<Option<awc::BoxedSocket>>>=Arc::new(Mutex::new(None));
-}
 
+    pub static ref GLOBAL_STREAM_MANAGER: Arc<MultiStreamManager> = {
+        Arc::new(MultiStreamManager::new(32)) // 你可根据需求传入参数
+    };
+
+}
 fn load_storage_path() -> PathBuf {
     "E:/WHU/SoftwareEngineering/GroupWork/LQMY-Desk".into()
 }
