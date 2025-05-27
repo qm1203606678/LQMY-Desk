@@ -296,7 +296,7 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
                         width: 854,
                         height: 480,
                         bitrate: 500000,
-                        fps: 24,
+                        fps: 30,
                     };
                     GLOBAL_STREAM_MANAGER.add_quality_stream(q).await;
                     GLOBAL_STREAM_MANAGER
