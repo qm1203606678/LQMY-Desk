@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{env, path::PathBuf};
+use tokio::sync::RwLock;
 
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -54,9 +55,9 @@ lazy_static! {
     // websocket 客户端的连接，全局共享
     //pub static ref WS_SENDER:Arc<Mutex<Option<awc::BoxedSocket>>>=Arc::new(Mutex::new(None));
 
-    pub static ref GLOBAL_STREAM_MANAGER: Arc<MultiStreamManager> = {
-        Arc::new(MultiStreamManager::new(32)) // 你可根据需求传入参数
-    };
+    pub static ref GLOBAL_STREAM_MANAGER: Arc<RwLock<MultiStreamManager>> =
+        Arc::new(RwLock::new(MultiStreamManager::new()));
+
 
 }
 fn load_storage_path() -> PathBuf {

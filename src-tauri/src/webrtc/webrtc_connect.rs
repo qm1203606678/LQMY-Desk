@@ -290,17 +290,17 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
                 let video_track2 = video_track.clone();
                 tokio::task::spawn(async move {
                     // 5. 启动后台任务，不断读包并写入 RTP Track
-                    GLOBAL_STREAM_MANAGER.start_capture();
-                    let q = QualityConfig {
-                        name: "480p".to_string(),
-                        width: 854,
-                        height: 480,
-                        bitrate: 500000,
-                        fps: 30,
-                    };
-                    GLOBAL_STREAM_MANAGER.add_quality_stream(q).await;
+                    GLOBAL_STREAM_MANAGER.write().await.start_capture().await;
+                    let q = QualityConfig::new("480p", 854, 480, 500000, 30);
+                    let sd_rx = GLOBAL_STREAM_MANAGER
+                        .read()
+                        .await
+                        .add_quality_stream(q)
+                        .await;
                     GLOBAL_STREAM_MANAGER
-                        .create_track_writer("480p", video_track2)
+                        .read()
+                        .await
+                        .add_webrtc_track("480p", video_track2)
                         .await;
                 });
                 // tokio::task::spawn(async move {

@@ -144,7 +144,7 @@ async fn backend_close_handler() {
 async fn revoke_control() {
     CURRENT_USERS_INFO.lock().unwrap().revoke_control();
 }
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() {
     tauri::Builder::default()
         // .on_window_event(|window, event| {

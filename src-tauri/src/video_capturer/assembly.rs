@@ -1,439 +1,668 @@
 use bytes::Bytes;
 use openh264::encoder::{Encoder, EncoderConfig, IntraFramePeriod, QpRange};
-
-use super::yuv::bgra_to_yuv420;
-use rayon::prelude::*;
+use openh264::formats::YUVSource;
 use rusty_duplication::{FrameInfoExt, Scanner, VecCapturer};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{broadcast, RwLock};
+use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
-/// Raw BGRA frame
+
+// ==================== 核心数据结构 ====================
+
+/// 原始帧数据 - 使用引用计数避免拷贝
 #[derive(Clone)]
 pub struct RawFrame {
     pub width: u32,
     pub height: u32,
-    pub bgra: Vec<u8>,
-    pub timestamp: u64, // 添加时间戳用于同步
+    pub data: Arc<Vec<u8>>, // BGRA数据
+    pub timestamp: u64,
+    pub frame_id: u64,
 }
 
-/// Quality settings for each stream
+/// 质量配置
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct QualityConfig {
-    pub width: i32,
-    pub height: i32,
-    pub bitrate: i32,
-    pub fps: i32,
-    pub name: String, // 用于标识不同的质量档次
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub bitrate: u32,
+    pub fps: u32,
+    pub max_keyframe_interval: u32, // 最大关键帧间隔
 }
 
-/// 编码后的帧数据
-#[derive(Clone)]
-pub struct EncodedFrame {
-    pub data: Bytes,
-    pub duration: Duration,
-    pub quality: String,
-}
-
-/// 多路流管理器
-pub struct MultiStreamManager {
-    raw_frame_tx: broadcast::Sender<RawFrame>,
-    encoded_streams: Arc<RwLock<HashMap<String, broadcast::Sender<EncodedFrame>>>>,
-    active_qualities: Arc<RwLock<HashMap<String, QualityConfig>>>,
-}
-
-impl MultiStreamManager {
-    pub fn new(buffer_size: usize) -> Self {
-        let (raw_frame_tx, _) = broadcast::channel(buffer_size);
-
+impl QualityConfig {
+    pub fn new(name: &str, width: u32, height: u32, bitrate: u32, fps: u32) -> Self {
         Self {
-            raw_frame_tx,
-            encoded_streams: Arc::new(RwLock::new(HashMap::new())),
-            active_qualities: Arc::new(RwLock::new(HashMap::new())),
+            name: name.to_string(),
+            width,
+            height,
+            bitrate,
+            fps,
+            max_keyframe_interval: fps * 2, // 默认2秒一个关键帧
         }
     }
 
-    /// 启动桌面捕获（只启动一次）
-    pub fn start_capture(&self) {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.width == 0 || self.height == 0 || self.width % 2 != 0 || self.height % 2 != 0 {
+            return Err("dimensions must be positive and even");
+        }
+        if self.fps == 0 || self.fps > 120 {
+            return Err("fps must be between 1 and 120");
+        }
+        if self.bitrate == 0 {
+            return Err("bitrate must be positive");
+        }
+        Ok(())
+    }
+}
+
+/// 编码后的帧
+#[derive(Clone)]
+pub struct EncodedFrame {
+    pub data: Bytes,
+    pub timestamp: u64,
+    pub frame_id: u64,
+    pub is_keyframe: bool,
+    pub quality: String,
+}
+
+/// YUV数据结构 - 优化内存布局
+pub struct YuvBuffer {
+    pub width: usize,
+    pub height: usize,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+impl YuvBuffer {
+    pub fn new(width: usize, height: usize) -> Self {
+        let y_size = width * height;
+        let uv_size = y_size / 4;
+
+        Self {
+            width,
+            height,
+            y: vec![0; y_size],
+            u: vec![0; uv_size],
+            v: vec![0; uv_size],
+        }
+    }
+
+    pub fn resize(&mut self, width: usize, height: usize) {
+        if self.width != width || self.height != height {
+            let y_size = width * height;
+            let uv_size = y_size / 4;
+
+            self.width = width;
+            self.height = height;
+            self.y.resize(y_size, 0);
+            self.u.resize(uv_size, 0);
+            self.v.resize(uv_size, 0);
+        }
+    }
+}
+
+impl YUVSource for YuvBuffer {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    fn strides(&self) -> (usize, usize, usize) {
+        (self.width, self.width / 2, self.width / 2)
+    }
+
+    fn y(&self) -> &[u8] {
+        &self.y
+    }
+
+    fn u(&self) -> &[u8] {
+        &self.u
+    }
+
+    fn v(&self) -> &[u8] {
+        &self.v
+    }
+}
+
+// ==================== 高效图像处理 ====================
+
+/// 快速BGRA到YUV420转换 - 优化算法
+pub fn convert_bgra_to_yuv420(
+    bgra: &[u8],
+    src_width: usize,
+    src_height: usize,
+    yuv: &mut YuvBuffer,
+) {
+    yuv.resize(src_width, src_height);
+
+    // 使用查找表优化的转换系数
+    const Y_R: i32 = 77; // 0.299 * 256
+    const Y_G: i32 = 150; // 0.587 * 256
+    const Y_B: i32 = 29; // 0.114 * 256
+    const U_R: i32 = -43; // -0.169 * 256
+    const U_G: i32 = -85; // -0.331 * 256
+    const U_B: i32 = 128; // 0.5 * 256
+    const V_R: i32 = 128; // 0.5 * 256
+    const V_G: i32 = -107; // -0.419 * 256
+    const V_B: i32 = -21; // -0.081 * 256
+
+    // Y平面处理 - 逐行处理提高缓存效率
+    for y in 0..src_height {
+        let y_offset = y * src_width;
+        let bgra_offset = y * src_width * 4;
+
+        for x in 0..src_width {
+            let pixel_idx = bgra_offset + x * 4;
+            let b = bgra[pixel_idx] as i32;
+            let g = bgra[pixel_idx + 1] as i32;
+            let r = bgra[pixel_idx + 2] as i32;
+
+            let y_val = ((Y_R * r + Y_G * g + Y_B * b) >> 8) + 16;
+            yuv.y[y_offset + x] = y_val.clamp(16, 235) as u8;
+        }
+    }
+
+    // UV平面处理 - 2x2子采样
+    let uv_width = src_width / 2;
+    let uv_height = src_height / 2;
+
+    for uv_y in 0..uv_height {
+        let uv_row_offset = uv_y * uv_width;
+
+        for uv_x in 0..uv_width {
+            let src_x = uv_x * 2;
+            let src_y = uv_y * 2;
+
+            // 采样2x2区域
+            let mut sum_u = 0i32;
+            let mut sum_v = 0i32;
+
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let pixel_idx = ((src_y + dy) * src_width + (src_x + dx)) * 4;
+                    let b = bgra[pixel_idx] as i32;
+                    let g = bgra[pixel_idx + 1] as i32;
+                    let r = bgra[pixel_idx + 2] as i32;
+
+                    sum_u += (U_R * r + U_G * g + U_B * b) >> 8;
+                    sum_v += (V_R * r + V_G * g + V_B * b) >> 8;
+                }
+            }
+
+            // 平均值并添加偏移
+            let uv_idx = uv_row_offset + uv_x;
+            yuv.u[uv_idx] = ((sum_u >> 2) + 128).clamp(16, 240) as u8;
+            yuv.v[uv_idx] = ((sum_v >> 2) + 128).clamp(16, 240) as u8;
+        }
+    }
+}
+
+/// 高效图像缩放 - 双线性插值
+pub fn resize_bgra(
+    src: &[u8],
+    src_width: usize,
+    src_height: usize,
+    dst: &mut [u8],
+    dst_width: usize,
+    dst_height: usize,
+) {
+    let x_scale = src_width as f32 / dst_width as f32;
+    let y_scale = src_height as f32 / dst_height as f32;
+
+    for dst_y in 0..dst_height {
+        let src_y_f = dst_y as f32 * y_scale;
+        let src_y = src_y_f as usize;
+        let y_frac = src_y_f - src_y as f32;
+        let src_y1 = (src_y + 1).min(src_height - 1);
+
+        for dst_x in 0..dst_width {
+            let src_x_f = dst_x as f32 * x_scale;
+            let src_x = src_x_f as usize;
+            let x_frac = src_x_f - src_x as f32;
+            let src_x1 = (src_x + 1).min(src_width - 1);
+
+            // 获取4个相邻像素
+            let p00_idx = (src_y * src_width + src_x) * 4;
+            let p01_idx = (src_y * src_width + src_x1) * 4;
+            let p10_idx = (src_y1 * src_width + src_x) * 4;
+            let p11_idx = (src_y1 * src_width + src_x1) * 4;
+
+            let dst_idx = (dst_y * dst_width + dst_x) * 4;
+
+            // 对每个颜色通道进行双线性插值
+            for c in 0..4 {
+                let p00 = src[p00_idx + c] as f32;
+                let p01 = src[p01_idx + c] as f32;
+                let p10 = src[p10_idx + c] as f32;
+                let p11 = src[p11_idx + c] as f32;
+
+                let top = p00 * (1.0 - x_frac) + p01 * x_frac;
+                let bottom = p10 * (1.0 - x_frac) + p11 * x_frac;
+                let result = top * (1.0 - y_frac) + bottom * y_frac;
+
+                dst[dst_idx + c] = result.clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+// ==================== 编码器管理 ====================
+
+/// 单个质量流的编码器
+struct QualityEncoder {
+    encoder: Encoder,
+    config: QualityConfig,
+    frame_interval: Duration,
+    last_encode_time: Instant,
+    frame_count: u64,
+    yuv_buffer: YuvBuffer,
+    resize_buffer: Vec<u8>,
+}
+
+impl QualityEncoder {
+    fn new(config: QualityConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let loader = openh264::OpenH264API::from_source();
+
+        let enc_config = EncoderConfig::new();
+        enc_config.skip_frames(false);
+        enc_config.bitrate(openh264::encoder::BitRate::from_bps(config.bitrate));
+        enc_config.max_frame_rate(openh264::encoder::FrameRate::from_hz(config.fps as f32));
+        enc_config.usage_type(openh264::encoder::UsageType::ScreenContentRealTime);
+        enc_config.profile(openh264::encoder::Profile::Baseline);
+        enc_config.level(openh264::encoder::Level::Level_3_1);
+        enc_config.complexity(openh264::encoder::Complexity::Low);
+        enc_config.qp(QpRange::new(20, 35));
+        enc_config.intra_frame_period(IntraFramePeriod::from_num_frames(
+            config.max_keyframe_interval,
+        ));
+
+        let encoder = Encoder::with_api_config(loader, enc_config)
+            .map_err(|e| format!("failed to create encoder: {}", e))?;
+
+        let frame_interval = Duration::from_nanos(1_000_000_000 / config.fps as u64);
+        let yuv_buffer = YuvBuffer::new(config.width as usize, config.height as usize);
+        let resize_buffer = vec![0u8; (config.width * config.height * 4) as usize];
+
+        Ok(Self {
+            encoder,
+            config,
+            frame_interval,
+            last_encode_time: Instant::now(),
+            frame_count: 0,
+            yuv_buffer,
+            resize_buffer,
+        })
+    }
+
+    fn should_encode(&self) -> bool {
+        self.last_encode_time.elapsed() >= self.frame_interval
+    }
+
+    fn encode(
+        &mut self,
+        raw_frame: &RawFrame,
+    ) -> Result<Option<EncodedFrame>, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.should_encode() {
+            return Ok(None);
+        }
+
+        self.last_encode_time = Instant::now();
+
+        // 缩放处理
+        let source_data =
+            if raw_frame.width == self.config.width && raw_frame.height == self.config.height {
+                &raw_frame.data[..]
+            } else {
+                resize_bgra(
+                    &raw_frame.data,
+                    raw_frame.width as usize,
+                    raw_frame.height as usize,
+                    &mut self.resize_buffer,
+                    self.config.width as usize,
+                    self.config.height as usize,
+                );
+                &self.resize_buffer[..]
+            };
+
+        // YUV转换
+        convert_bgra_to_yuv420(
+            source_data,
+            self.config.width as usize,
+            self.config.height as usize,
+            &mut self.yuv_buffer,
+        );
+
+        // H.264编码
+        match self.encoder.encode(&self.yuv_buffer) {
+            Ok(bitstream) => {
+                let is_keyframe = self.frame_count % self.config.max_keyframe_interval as u64 == 0;
+
+                let encoded_frame = EncodedFrame {
+                    data: Bytes::from(bitstream.to_vec()),
+                    timestamp: raw_frame.timestamp,
+                    frame_id: raw_frame.frame_id,
+                    is_keyframe,
+                    quality: self.config.name.clone(),
+                };
+
+                self.frame_count += 1;
+                Ok(Some(encoded_frame))
+            }
+            Err(e) => Err(format!("encoding failed: {}", e).into()),
+        }
+    }
+}
+
+// ==================== 主管理器 ====================
+
+/// 优化后的多流管理器
+pub struct MultiStreamManager {
+    // 原始帧广播
+    raw_frame_tx: broadcast::Sender<RawFrame>,
+
+    // 编码器管理
+    encoders: Arc<Mutex<HashMap<String, QualityEncoder>>>,
+
+    // 编码后的帧分发
+    encoded_streams: Arc<RwLock<HashMap<String, broadcast::Sender<EncodedFrame>>>>,
+
+    // WebRTC轨道管理
+    track_writers: Arc<RwLock<HashMap<String, Vec<Arc<TrackLocalStaticSample>>>>>,
+
+    // 控制信号
+    shutdown_signal: Arc<AtomicBool>,
+    frame_counter: Arc<AtomicU64>,
+
+    // 任务句柄
+    capture_handle: Option<tokio::task::JoinHandle<()>>,
+    encoding_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl MultiStreamManager {
+    pub fn new() -> Self {
+        let (raw_frame_tx, _) = broadcast::channel(8); // 较小的缓冲区，避免延迟
+
+        Self {
+            raw_frame_tx,
+            encoders: Arc::new(Mutex::new(HashMap::new())),
+            encoded_streams: Arc::new(RwLock::new(HashMap::new())),
+            track_writers: Arc::new(RwLock::new(HashMap::new())),
+            shutdown_signal: Arc::new(AtomicBool::new(false)),
+            frame_counter: Arc::new(AtomicU64::new(0)),
+            capture_handle: None,
+            encoding_handle: None,
+        }
+    }
+
+    /// 启动桌面捕获
+    pub async fn start_capture(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.capture_handle.is_some() {
+            return Ok(());
+        }
+
         let tx = self.raw_frame_tx.clone();
+        let shutdown_signal = self.shutdown_signal.clone();
+        let frame_counter = self.frame_counter.clone();
 
-        tokio::spawn(async move {
-            // Initialize monitor scanner
-            let mut scanner = Scanner::new().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut scanner = Scanner::new().expect("failed to create scanner");
             let monitor = scanner.next().expect("no monitor found");
-            let mut capturer: VecCapturer = monitor.try_into().unwrap();
-            let mut frame_counter = 0u64;
+            let mut capturer: VecCapturer = monitor.try_into().expect("failed to create capturer");
 
-            loop {
-                // Sleep to throttle (~30fps)
-                tokio::time::sleep(Duration::from_millis(33)).await;
+            let mut last_capture = Instant::now();
+            let capture_interval = Duration::from_millis(16); // ~60fps
+
+            while !shutdown_signal.load(Ordering::Relaxed) {
+                if last_capture.elapsed() < capture_interval {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    continue;
+                }
 
                 if let Ok(info) = capturer.capture() {
                     if info.desktop_updated() {
                         let desc = capturer.monitor().dxgi_outdupl_desc();
-                        let (w, h) = (desc.ModeDesc.Width, desc.ModeDesc.Height);
-                        let bgra = capturer.buffer.clone();
+                        let frame_id = frame_counter.fetch_add(1, Ordering::Relaxed);
 
-                        let frame = RawFrame {
-                            width: w,
-                            height: h,
-                            bgra,
-                            timestamp: frame_counter,
+                        let raw_frame = RawFrame {
+                            width: desc.ModeDesc.Width,
+                            height: desc.ModeDesc.Height,
+                            data: Arc::new(capturer.buffer.clone()),
+                            timestamp: frame_id, // 简化时间戳
+                            frame_id,
                         };
 
-                        frame_counter += 1;
+                        last_capture = Instant::now();
 
-                        // 发送原始帧给所有编码器
-                        let _ = tx.send(frame);
+                        if tx.send(raw_frame).is_err() {
+                            break; // 所有接收者都已关闭
+                        }
                     }
+                }
+
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        self.capture_handle = Some(handle);
+        self.start_encoding_worker().await;
+
+        Ok(())
+    }
+
+    /// 启动编码工作线程
+    async fn start_encoding_worker(&mut self) {
+        if self.encoding_handle.is_some() {
+            return;
+        }
+
+        let mut raw_rx = self.raw_frame_tx.subscribe();
+        let encoders = self.encoders.clone();
+        let encoded_streams = self.encoded_streams.clone();
+        let shutdown_signal = self.shutdown_signal.clone();
+
+        let handle = tokio::spawn(async move {
+            while !shutdown_signal.load(Ordering::Relaxed) {
+                match tokio::time::timeout(Duration::from_millis(50), raw_rx.recv()).await {
+                    Ok(Ok(raw_frame)) => {
+                        // 获取所有编码器的快照
+                        let mut encoder_guard = encoders.lock().await;
+                        let mut encoded_frames = Vec::new();
+
+                        // 对每个质量进行编码
+                        for (quality_name, encoder) in encoder_guard.iter_mut() {
+                            match encoder.encode(&raw_frame) {
+                                Ok(Some(encoded_frame)) => {
+                                    encoded_frames.push((quality_name.clone(), encoded_frame));
+                                }
+                                Ok(None) => {
+                                    // 跳帧，正常情况
+                                }
+                                Err(e) => {
+                                    eprintln!("Encoding error for {}: {}", quality_name, e);
+                                }
+                            }
+                        }
+
+                        drop(encoder_guard);
+
+                        // 分发编码后的帧
+                        let streams = encoded_streams.read().await;
+                        for (quality_name, encoded_frame) in encoded_frames {
+                            if let Some(tx) = streams.get(&quality_name) {
+                                let _ = tx.send(encoded_frame); // 忽略发送错误
+                            }
+                        }
+                    }
+                    Ok(Err(_)) => break, // 发送者关闭
+                    Err(_) => continue,  // 超时，继续等待
                 }
             }
         });
+
+        self.encoding_handle = Some(handle);
     }
 
-    /// 添加新的质量档次（如果不存在则创建编码器）
+    /// 添加质量流
     pub async fn add_quality_stream(
         &self,
-        quality: QualityConfig,
-    ) -> broadcast::Receiver<EncodedFrame> {
-        let quality_name = quality.name.clone();
+        config: QualityConfig,
+    ) -> Result<broadcast::Receiver<EncodedFrame>, Box<dyn std::error::Error + Send + Sync>> {
+        config.validate()?;
 
-        // 检查是否已存在该质量档次
+        let quality_name = config.name.clone();
+
+        // 检查是否已存在
         {
             let streams = self.encoded_streams.read().await;
             if let Some(tx) = streams.get(&quality_name) {
-                return tx.subscribe();
+                return Ok(tx.subscribe());
             }
         }
 
-        // 创建新的编码流
-        let (encoded_tx, encoded_rx) = broadcast::channel(100);
+        // 创建编码器
+        let encoder = QualityEncoder::new(config)?;
+
+        // 创建广播通道
+        let (tx, rx) = broadcast::channel(16);
 
         // 添加到管理器
         {
+            let mut encoders = self.encoders.lock().await;
             let mut streams = self.encoded_streams.write().await;
-            let mut qualities = self.active_qualities.write().await;
 
-            streams.insert(quality_name.clone(), encoded_tx.clone());
-            qualities.insert(quality_name.clone(), quality.clone());
+            encoders.insert(quality_name.clone(), encoder);
+            streams.insert(quality_name, tx);
         }
 
-        // 启动该质量档次的编码器
-        self.spawn_quality_encoder(quality, encoded_tx).await;
-
-        encoded_rx
+        Ok(rx)
     }
 
-    /// 为特定质量档次启动编码器
-    async fn spawn_quality_encoder(
-        &self,
-        quality: QualityConfig,
-        encoded_tx: broadcast::Sender<EncodedFrame>,
-    ) {
-        let raw_rx = self.raw_frame_tx.subscribe();
-
-        tokio::spawn(async move {
-            Self::encode_stream(raw_rx, encoded_tx, quality).await;
-        });
-    }
-
-    /// 编码流处理
-    async fn encode_stream(
-        mut raw_rx: broadcast::Receiver<RawFrame>,
-        encoded_tx: broadcast::Sender<EncodedFrame>,
-        quality: QualityConfig,
-    ) {
-        // 初始化 OpenH264 编码器
-        let encoder_result = Self::create_encoder(&quality);
-        let mut encoder = match encoder_result {
-            Ok(enc) => enc,
-            Err(e) => {
-                eprintln!("Failed to create encoder for {}: {}", quality.name, e);
-                return;
-            }
-        };
-
-        let mut last_frame_time = std::time::Instant::now();
-        let frame_interval = Duration::from_millis(1000 / quality.fps as u64);
-
-        while let Ok(raw_frame) = raw_rx.recv().await {
-            // 帧率控制
-            let now = std::time::Instant::now();
-            if now.duration_since(last_frame_time) < frame_interval {
-                continue;
-            }
-            last_frame_time = now;
-
-            // 缩放和处理帧
-            let processed_bgra = Self::process_frame(&raw_frame, &quality);
-
-            let yuv_data = bgra_to_yuv420(
-                &processed_bgra,
-                quality.width as usize,
-                quality.height as usize,
-            );
-
-            // 创建 YUV buffer
-            // let yuv_buffer = YUVBuffer::with_rgb_to_yuv(
-            //     &yuv_data.y,
-            //     &yuv_data.u,
-            //     &yuv_data.v,
-            //     quality.width as usize,
-            //     quality.height as usize,
-            // );
-            // 编码
-            match encoder.encode(&yuv_data) {
-                Ok(bitstream) => {
-                    //let avcc_data = annexb_to_avcc(&bitstream.to_vec());
-                    let encoded_frame = EncodedFrame {
-                        data: Bytes::from(bitstream.to_vec()),
-                        duration: frame_interval,
-                        quality: quality.name.clone(),
-                    };
-
-                    // 发送编码后的帧
-                    if encoded_tx.send(encoded_frame).is_err() {
-                        break; // 没有接收者了，退出编码循环
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Encoding error for {}: {}", quality.name, e);
-                }
-            }
-        }
-    }
-
-    /// 创建编码器
-    fn create_encoder(
-        quality: &QualityConfig,
-    ) -> Result<Encoder, Box<dyn std::error::Error + Send + Sync>> {
-        let loader = openh264::OpenH264API::from_source();
-
-        // 3) 配置编码器
-        let ecfg = EncoderConfig::new();
-        let _ = ecfg.skip_frames(false); //不跳过静止帧
-        let _ = ecfg.bitrate(openh264::encoder::BitRate::from_bps(quality.bitrate as u32));
-        let _ = ecfg.max_frame_rate(openh264::encoder::FrameRate::from_hz(quality.fps as f32));
-        let _ = ecfg.num_threads(4);
-        let _ = ecfg.usage_type(openh264::encoder::UsageType::CameraVideoRealTime);
-        let _ = ecfg.profile(openh264::encoder::Profile::Baseline);
-        let _ = ecfg.level(openh264::encoder::Level::Level_3_1);
-        let _ = ecfg.complexity(openh264::encoder::Complexity::Medium);
-        let _ = ecfg.qp(QpRange::new(24, 38));
-        let _ = ecfg.intra_frame_period(IntraFramePeriod::from_num_frames(30));
-        let encoder = Encoder::with_api_config(loader, ecfg).expect("OpenH264 encoder init failed");
-
-        Ok(encoder)
-    }
-
-    /// 处理帧（缩放）
-    fn process_frame(raw_frame: &RawFrame, quality: &QualityConfig) -> Vec<u8> {
-        let src_width = raw_frame.width as usize;
-        let src_height = raw_frame.height as usize;
-        let dst_width = quality.width as usize;
-        let dst_height = quality.height as usize;
-
-        // 如果尺寸匹配，直接返回
-        if src_width == dst_width && src_height == dst_height {
-            return raw_frame.bgra.clone();
-        }
-
-        // 执行缩放
-        scale_bgra(
-            &raw_frame.bgra,
-            src_width,
-            src_height,
-            dst_width,
-            dst_height,
-        )
-    }
-
-    /// 为 WebRTC track 创建样本写入器
-    pub async fn create_track_writer(
+    /// 为质量流添加WebRTC轨道
+    pub async fn add_webrtc_track(
         &self,
         quality_name: &str,
         track: Arc<TrackLocalStaticSample>,
-    ) {
-        let encoded_streams = self.encoded_streams.read().await;
-        if let Some(tx) = encoded_streams.get(quality_name) {
-            let mut rx = tx.subscribe();
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 获取编码流
+        let mut encoded_rx = {
+            let streams = self.encoded_streams.read().await;
+            let tx = streams
+                .get(quality_name)
+                .ok_or("quality stream not found")?
+                .clone();
+            tx.subscribe()
+        };
 
-            tokio::spawn(async move {
-                while let Ok(encoded_frame) = rx.recv().await {
-                    let sample = Sample {
-                        data: encoded_frame.data,
-                        duration: encoded_frame.duration,
-                        ..Default::default()
-                    };
+        // 添加到轨道管理器
+        {
+            let mut track_writers = self.track_writers.write().await;
+            track_writers
+                .entry(quality_name.to_string())
+                .or_insert_with(Vec::new)
+                .push(track.clone());
+        }
 
-                    if let Err(e) = track.write_sample(&sample).await {
-                        println!("[WRITE SAMPLE]关闭因为，{:?}", e);
-                        break; // WebRTC track 关闭了
+        // 启动WebRTC写入任务
+        let shutdown_signal = self.shutdown_signal.clone();
+        let quality_name = quality_name.to_string();
+
+        tokio::spawn(async move {
+            while !shutdown_signal.load(Ordering::Relaxed) {
+                match tokio::time::timeout(Duration::from_millis(100), encoded_rx.recv()).await {
+                    Ok(Ok(encoded_frame)) => {
+                        let sample = Sample {
+                            data: encoded_frame.data,
+                            duration: Duration::from_millis(33), // 根据实际帧率调整
+                            ..Default::default()
+                        };
+
+                        if let Err(e) = track.write_sample(&sample).await {
+                            eprintln!("Failed to write sample for {}: {}", quality_name, e);
+                            break;
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        // 发送者关闭
+                        break;
+                    }
+                    Err(_) => {
+                        // 超时，继续等待
+                        continue;
                     }
                 }
-            });
-        }
+            }
+        });
+
+        Ok(())
     }
 
-    /// 获取活跃的质量档次列表
-    pub async fn get_active_qualities(&self) -> Vec<QualityConfig> {
-        let qualities = self.active_qualities.read().await;
-        qualities.values().cloned().collect()
-    }
-
-    /// 移除不再使用的质量档次
+    /// 移除质量流
     pub async fn remove_quality_stream(&self, quality_name: &str) {
+        let mut encoders = self.encoders.lock().await;
         let mut streams = self.encoded_streams.write().await;
-        let mut qualities = self.active_qualities.write().await;
+        let mut track_writers = self.track_writers.write().await;
 
+        encoders.remove(quality_name);
         streams.remove(quality_name);
-        qualities.remove(quality_name);
+        track_writers.remove(quality_name);
     }
-}
 
-/// Convert Annex-B (0x00000001) to AVCC length-prefix format
-fn annexb_to_avcc(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut i = 0;
-    while i + 4 <= data.len() {
-        if &data[i..i + 4] == [0, 0, 0, 1] {
-            i += 4;
-            let start = i;
-            while i + 4 <= data.len() && &data[i..i + 4] != [0, 0, 0, 1] {
-                i += 1;
-            }
-            let nal = &data[start..i];
-            out.extend(&(nal.len() as u32).to_be_bytes());
-            out.extend(nal);
-        } else {
-            i += 1;
+    /// 获取活跃的质量配置
+    pub async fn get_active_qualities(&self) -> Vec<String> {
+        let encoders = self.encoders.lock().await;
+        encoders.keys().cloned().collect()
+    }
+
+    /// 关闭管理器
+    pub async fn shutdown(&mut self) {
+        self.shutdown_signal.store(true, Ordering::Relaxed);
+
+        if let Some(handle) = self.capture_handle.take() {
+            let _ = handle.await;
         }
+
+        if let Some(handle) = self.encoding_handle.take() {
+            let _ = handle.await;
+        }
+
+        // 清理资源
+        self.encoders.lock().await.clear();
+        self.encoded_streams.write().await.clear();
+        self.track_writers.write().await.clear();
     }
-    out
 }
 
-// 实现图像缩放函数
-fn scale_bgra(
-    src: &[u8],
-    src_width: usize,
-    src_height: usize,
-    dst_width: usize,
-    dst_height: usize,
-) -> Vec<u8> {
-    // 1. 定点精度：16-bit fractional (0..65535)
-    const FP_SHIFT: usize = 16;
-    const FP_ONE: usize = 1 << FP_SHIFT;
+impl Drop for MultiStreamManager {
+    fn drop(&mut self) {
+        self.shutdown_signal.store(true, Ordering::Relaxed);
+    }
+}
 
-    // 2. 第一阶段：横向插值，输出中间缓冲区 mid (u32 packed with BGRA channels expanded to u16)
-    //    大小 = src_height * dst_width
-    let mut mid = vec![0u32; src_height * dst_width];
+// ==================== 使用示例 ====================
 
-    // 2.1 预计算 dst_x -> (src_x0, weight_x0, weight_x1)
-    let x_map: Vec<(usize, u32, u32)> = (0..dst_width)
-        .map(|x| {
-            // 对应 src 的浮点位置
-            let fx = x * src_width * FP_ONE / dst_width;
-            let sx = fx >> FP_SHIFT; // integer part
-            let wx1 = (fx & (FP_ONE - 1)) as u32; // frac part
-            let wx0 = (FP_ONE as u32 - wx1); // 1 - frac
-                                             // clamp 防止溢界取最后一列
-            let sx = if sx + 1 < src_width {
-                sx
-            } else {
-                src_width - 1
-            };
-            (sx, wx0, wx1)
-        })
-        .collect();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // 并行处理每一源行
-    mid.par_chunks_exact_mut(dst_width)
-        .enumerate()
-        .for_each(|(y, mid_row)| {
-            let src_row = &src[y * src_width * 4..(y + 1) * src_width * 4];
-            for (dx, &(sx, wx0, wx1)) in x_map.iter().enumerate() {
-                // 读两个相邻像素，u32 载入
-                unsafe {
-                    let p0 = *(src_row.as_ptr().add(sx * 4) as *const u32);
-                    let p1 = *(src_row.as_ptr().add((sx + 1) * 4) as *const u32);
-                    // 拆通道到 u16，按权重累加，再右移回 8-bit
-                    let b0 = (p0 & 0xFF) as u32;
-                    let g0 = ((p0 >> 8) & 0xFF) as u32;
-                    let r0 = ((p0 >> 16) & 0xFF) as u32;
-                    let a0 = ((p0 >> 24) & 0xFF) as u32;
-                    let b1 = (p1 & 0xFF) as u32;
-                    let g1 = ((p1 >> 8) & 0xFF) as u32;
-                    let r1 = ((p1 >> 16) & 0xFF) as u32;
-                    let a1 = ((p1 >> 24) & 0xFF) as u32;
+    #[tokio::test]
+    async fn test_manager_lifecycle() {
+        let mut manager = MultiStreamManager::new();
 
-                    let b = ((b0 * wx0 + b1 * wx1) >> FP_SHIFT) as u32;
-                    let g = ((g0 * wx0 + g1 * wx1) >> FP_SHIFT) as u32;
-                    let r = ((r0 * wx0 + r1 * wx1) >> FP_SHIFT) as u32;
-                    let a = ((a0 * wx0 + a1 * wx1) >> FP_SHIFT) as u32;
+        // 启动捕获
+        manager.start_capture().await.unwrap();
 
-                    // 重新打包到 u32
-                    mid_row[dx] = b | (g << 8) | (r << 16) | (a << 24);
-                }
-            }
-        });
+        // 添加质量流
+        let config = QualityConfig::new("720p", 1280, 720, 2_000_000, 30);
+        let _rx = manager.add_quality_stream(config).await.unwrap();
 
-    // 3. 第二阶段：纵向插值，从 mid -> dst
-    let mut dst = vec![0u8; dst_width * dst_height * 4];
+        // 等待一段时间
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // 3.1 预计算 dst_y -> (src_y0, weight_y0, weight_y1)
-    let y_map: Vec<(usize, u32, u32)> = (0..dst_height)
-        .map(|y| {
-            let fy = y * src_height * FP_ONE / dst_height;
-            let sy = fy >> FP_SHIFT;
-            let wy1 = (fy & (FP_ONE - 1)) as u32;
-            let wy0 = (FP_ONE as u32 - wy1);
-            let sy = if sy + 1 < src_height {
-                sy
-            } else {
-                src_height - 1
-            };
-            (sy, wy0, wy1)
-        })
-        .collect();
-
-    // 并行生成每一目标行
-    dst.par_chunks_exact_mut(dst_width * 4)
-        .enumerate()
-        .for_each(|(dy, dst_row)| {
-            let (sy, wy0, wy1) = y_map[dy];
-            let row0 = &mid[sy * dst_width..(sy + 1) * dst_width];
-            let row1 = &mid[(sy + 1) * dst_width..(sy + 2) * dst_width];
-
-            for x in 0..dst_width {
-                unsafe {
-                    let p0 = row0[x];
-                    let p1 = row1[x];
-                    // 拆通道
-                    let b0 = (p0 & 0xFF) as u32;
-                    let g0 = ((p0 >> 8) & 0xFF) as u32;
-                    let r0 = ((p0 >> 16) & 0xFF) as u32;
-                    let a0 = ((p0 >> 24) & 0xFF) as u32;
-                    let b1 = (p1 & 0xFF) as u32;
-                    let g1 = ((p1 >> 8) & 0xFF) as u32;
-                    let r1 = ((p1 >> 16) & 0xFF) as u32;
-                    let a1 = ((p1 >> 24) & 0xFF) as u32;
-
-                    // 按权重累加
-                    let b = ((b0 * wy0 + b1 * wy1) >> FP_SHIFT) as u8;
-                    let g = ((g0 * wy0 + g1 * wy1) >> FP_SHIFT) as u8;
-                    let r = ((r0 * wy0 + r1 * wy1) >> FP_SHIFT) as u8;
-                    let a = ((a0 * wy0 + a1 * wy1) >> FP_SHIFT) as u8;
-
-                    let dst_px = dst_row.as_mut_ptr().add(x * 4);
-                    *dst_px = b;
-                    *dst_px.add(1) = g;
-                    *dst_px.add(2) = r;
-                    *dst_px.add(3) = a;
-                }
-            }
-        });
-
-    dst
+        // 关闭
+        manager.shutdown().await;
+    }
 }
