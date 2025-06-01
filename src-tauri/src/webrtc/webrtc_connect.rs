@@ -58,7 +58,7 @@ pub struct CandidateResponse {
 pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerResponse {
     println!("[WEBRTC]准备启动");
     let client_uuid = &offer.client_uuid;
-
+    let mode = &offer.mode;
     // 1. 初始化 MediaEngine 并注册 codecs
     let mut m = MediaEngine::default();
     if let Err(e) = m.register_default_codecs() {
@@ -271,7 +271,7 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
     {
         let pc2 = pc.clone();
         let client_uuid2 = client_uuid.clone();
-        let mode = offer.mode.clone();
+        let mode2 = format!("{:?}", mode.clone());
         pc.on_peer_connection_state_change(Box::new(move |state| {
             println!("[WEBRTC]连接状态改变，ConnectionState： {:?}", state);
 
@@ -279,13 +279,13 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
                 println!("✅ DTLS 握手成功");
                 let video_track2 = video_track.clone();
                 let client_uuid3 = client_uuid2.clone();
-                let mode3 = mode.clone();
+                let mode3 = mode2.clone();
                 tokio::task::spawn(async move {
                     // 5. 启动后台任务，不断读包并写入 RTP Track
                     if let Err(e) = GLOBAL_STREAM_MANAGER.write().await.start_capture().await {
                         println!("[STREAM MANAGER]关闭失败：{:?}", e)
                     };
-                    let q = select_mode(&mode3, client_uuid);
+                    let q = select_mode(&mode3, &client_uuid3);
                     let _sd_rx = GLOBAL_STREAM_MANAGER
                         .read()
                         .await
