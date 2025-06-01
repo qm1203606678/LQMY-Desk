@@ -25,6 +25,9 @@
 
         <div class="connectors-info">
             <h2>连接用户</h2>
+            <button class="btn disconnect" @click="disconnectALL()">
+                全部断开
+            </button>
             <div class="user-bars">
                 <div v-for="(user, idx) in orderedUsers" :key="user.device_id" class="user-bar"
                     :class="{ controller: idx === 0 && pointer < max }">
@@ -81,10 +84,15 @@ export default {
             console.log("断接用户：", user.uuid);
         }
 
+        // 断开所有用户
+        function disconnectALL() {
+            invoke('shutdown_caputure');
+            console.log("断接所有用户");
+        }
         // “取消控制” 操作
         function revokeControl(user) {
             // TODO: 调用 Tauri 后端命令，比如：
-            // invoke('revoke_control', { device_id: user.device_id });
+            invoke("revoke_control");
             console.log("取消控制：", user.device_id);
         }
 
@@ -164,6 +172,7 @@ export default {
             orderedUsers,
             disconnectUser,
             revokeControl,
+            disconnectALL,
         };
     },
 };

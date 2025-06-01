@@ -1,23 +1,18 @@
 use crate::client::{PENDING, SEND_NOTIFY};
 use crate::config::{GLOBAL_STREAM_MANAGER, PEER_CONNECTION, UUID};
 use crate::video_capturer::assembly::QualityConfig;
-use crate::video_capturer::ffmpeg::{end_screen_capture, start_screen_capture};
 
 use actix_web::web;
 
-use rustls::client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::net::SocketAddr;
+
 use std::sync::Arc;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-use tokio::net::UdpSocket;
 use webrtc::data_channel::RTCDataChannel;
 
 use webrtc::rtp_transceiver::RTCPFeedback;
-use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
-use webrtc::track::track_local::TrackLocalWriter;
 
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
@@ -57,12 +52,6 @@ pub struct JWTCandidateRequest {
 #[derive(Serialize)]
 pub struct CandidateResponse {
     pub candidates: RTCIceCandidateInit,
-}
-
-#[derive(Deserialize)]
-struct ControlCmd {
-    cmd: String,
-    mode: String,
 }
 
 // 初始 Offer/Answer，返回 AnswerResponse
@@ -282,50 +271,36 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
     {
         let pc2 = pc.clone();
         let client_uuid2 = client_uuid.clone();
+        let mode = offer.mode.clone();
         pc.on_peer_connection_state_change(Box::new(move |state| {
             println!("[WEBRTC]连接状态改变，ConnectionState： {:?}", state);
 
             if state == RTCPeerConnectionState::Connected {
                 println!("✅ DTLS 握手成功");
                 let video_track2 = video_track.clone();
+                let client_uuid3 = client_uuid2.clone();
+                let mode3 = mode.clone();
                 tokio::task::spawn(async move {
                     // 5. 启动后台任务，不断读包并写入 RTP Track
-                    GLOBAL_STREAM_MANAGER.write().await.start_capture().await;
-                    let q = QualityConfig::new("480p", 854, 480, 500000, 30);
-                    let sd_rx = GLOBAL_STREAM_MANAGER
+                    if let Err(e) = GLOBAL_STREAM_MANAGER.write().await.start_capture().await {
+                        println!("[STREAM MANAGER]关闭失败：{:?}", e)
+                    };
+                    let q = select_mode(&mode3, client_uuid);
+                    let _sd_rx = GLOBAL_STREAM_MANAGER
                         .read()
                         .await
                         .add_quality_stream(q)
                         .await;
-                    GLOBAL_STREAM_MANAGER
+
+                    if let Err(e) = GLOBAL_STREAM_MANAGER
                         .read()
                         .await
-                        .add_webrtc_track("480p", video_track2)
-                        .await;
+                        .add_webrtc_track(&client_uuid3.clone().as_str(), video_track2)
+                        .await
+                    {
+                        println!("[STREAM MANAGER]启动写track失败：{:?}", e)
+                    };
                 });
-                // tokio::task::spawn(async move {
-                //     let mut buf = vec![0u8; 1500];
-                //     let bind_addr: SocketAddr = format!("127.0.0.1:{}", 8765).parse().unwrap();
-                //     let socket = UdpSocket::bind(bind_addr).await.unwrap();
-                //     loop {
-                //         if let Ok((size, _peer)) = socket.recv_from(&mut buf).await {
-                //             //println!("[RTP]{:?}", buf[..12].to_vec());
-                //             let mut inner = &buf[..size];
-                //             if let Err(err) = video_track2.write(&inner).await {
-                //                 eprintln!("[H264Sample] write err: {}", err);
-                //             }
-                //         } else {
-                //             println!("[VIDEOSTREAM]packet_buf{:?}", buf)
-                //         }
-                //     }
-                // });
-                // // if let None = *FFMPEG_CHILD.lock().unwrap() {
-
-                // // } else {
-                // //     println!("[FFMPEG]已启动")
-                // // }
-                // start_screen_capture(8765);
-                // println!("[VIDEOTRACK] 启动 UDP→WebRTC 推流 @{}", 8765);
             } else if state == RTCPeerConnectionState::Closed {
                 let pc3 = pc2.clone();
                 let client_uuid3 = client_uuid2.clone();
@@ -333,9 +308,13 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
                     if let Err(e) = pc3.close().await {
                         println!("[RTC]关闭peerconnection失败{:?}", e)
                     } else {
+                        GLOBAL_STREAM_MANAGER
+                            .write()
+                            .await
+                            .close_track_write(&client_uuid3)
+                            .await;
                         println!("[RTC]被动关闭{:?}的连接", client_uuid3)
                     }
-                    end_screen_capture(false);
                 });
             } else if state == RTCPeerConnectionState::Disconnected {
                 let pc3 = pc2.clone();
@@ -349,9 +328,13 @@ pub async fn handle_webrtc_offer(offer: &web::Json<JWTOfferRequest>) -> AnswerRe
                     if let Err(e) = pc3.close().await {
                         println!("[RTC]关闭peerconnection失败{:?}", e)
                     } else {
+                        GLOBAL_STREAM_MANAGER
+                            .write()
+                            .await
+                            .close_track_write(&client_uuid3)
+                            .await;
                         println!("[RTC]被动关闭{:?}的连接", client_uuid3)
                     };
-                    end_screen_capture(false);
                 });
             }
             Box::pin(async {})
@@ -475,8 +458,21 @@ pub async fn close_peerconnection(client_uuid: &str) {
         } // MutexGuard is dropped here
 
         println!("[CLOSE PC]指定用户的RTC关闭成功，{:?}", client_uuid);
-        end_screen_capture(false);
+        //end_screen_capture(false);
+        GLOBAL_STREAM_MANAGER
+            .write()
+            .await
+            .close_track_write(client_uuid)
+            .await
     } else {
         println!("[CLOSE PC]指定用户的RTC连接不存在{:?}", client_uuid);
+    }
+}
+
+fn select_mode(mode: &str, client_uuid: &str) -> QualityConfig {
+    match mode {
+        "low" => QualityConfig::new(client_uuid, 320, 240, 10000, 30),
+        "high" => QualityConfig::new(client_uuid, 1920, 1080, 500000, 30),
+        _ => QualityConfig::new(client_uuid, 1280, 720, 100000, 30),
     }
 }

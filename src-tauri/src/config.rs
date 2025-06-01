@@ -1,8 +1,6 @@
-use actix_web::web;
-
 use lazy_static::lazy_static;
 use rand::{distr::Alphanumeric, Rng};
-use serde::{Deserialize, Serialize};
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{env, path::PathBuf};
@@ -12,10 +10,7 @@ use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::client_utils::current_user::CurUsersInfo;
-use crate::client_utils::{
-    auth::AuthRequest,
-    user_manager::{UserInfo, UserType},
-};
+use crate::client_utils::user_manager::{UserInfo, UserType};
 use crate::video_capturer::assembly::MultiStreamManager;
 pub const NO_CONNECTION_INDENTIFIER: &str = "!@#$%^&*()";
 // 存储全局信息的结构体

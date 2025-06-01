@@ -3,7 +3,8 @@
 mod client;
 mod client_utils;
 mod config;
-mod error;
+//mod error;
+//mod audio_capture;
 mod video_capturer;
 mod webrtc;
 use std::sync::{
@@ -17,8 +18,7 @@ use client_utils::{
     disconnect::disconnect_cur_user_by_uuid,
     user_manager::{delete_user, transfer_userinfo_to_vue, update_user_category, UserInfoString},
 };
-use config::{reset_all_info, CONFIG, CURRENT_USERS_INFO, PEER_CONNECTION, UUID};
-use video_capturer::ffmpeg::end_screen_capture;
+use config::{reset_all_info, CONFIG, CURRENT_USERS_INFO, GLOBAL_STREAM_MANAGER, UUID};
 use webrtc::webrtc_connect::close_peerconnection;
 
 //use actix_web::{web, App, HttpServer, HttpResponse};
@@ -48,6 +48,9 @@ fn start_server(state: tauri::State<AppState>) {
 
 #[tauri::command]
 fn stop_server(state: tauri::State<AppState>) {
+    let _ = tokio::spawn(async move {
+        shutdown_caputure().await;
+    });
     state.is_running.store(false, Ordering::Relaxed);
     // 重置连接状况，将连接者信息清楚
     state
@@ -115,47 +118,56 @@ async fn disconnect_by_uuid(uuid: String) {
 }
 #[tauri::command]
 async fn backend_close_handler() {
-    // 1. 先收集所有连接的克隆
-    let connections_to_close = {
-        let pcs = PEER_CONNECTION.lock().unwrap();
-        pcs.iter()
-            .map(|(uuid, pc)| (uuid.clone(), pc.clone()))
-            .collect::<Vec<_>>()
-    }; // MutexGuard 在这里被释放
-
-    // 2. 逐个关闭连接
-    for (uuid, pc) in connections_to_close {
-        if let Err(e) = pc.close().await {
-            println!("[CLOSE]uuid:{:?}关闭失败，{:?}", uuid, e);
-        }
-    }
-
-    // 3. 清空 HashMap
-    {
-        let mut pcs = PEER_CONNECTION.lock().unwrap();
-        pcs.clear();
-    }
-
-    // 关闭录屏
-    end_screen_capture(true);
+    shutdown_caputure().await
 }
 #[tauri::command]
-/// 本地函数,不会向对方发消息
+/// 撤销控制，会向对方发消息
 async fn revoke_control() {
     CURRENT_USERS_INFO.lock().unwrap().revoke_control();
 }
+#[tauri::command]
+async fn shutdown_caputure() {
+    let cur_users = CURRENT_USERS_INFO.lock().unwrap().usersinfo.clone();
+    for curinfo in cur_users.iter() {
+        close_peerconnection(&curinfo.uuid).await;
+        disconnect_cur_user_by_uuid(&curinfo.uuid);
+    }
+    drop(cur_users);
+    GLOBAL_STREAM_MANAGER.write().await.shutdown().await;
+    CURRENT_USERS_INFO.lock().unwrap().reset();
+    println!("[SERVER]关闭捕获，全部用户断开")
+}
+
+static SHUTDOWN_CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() {
     tauri::Builder::default()
-        // .on_window_event(|window, event| {
-        //     match event {
-        //         tauri::WindowEvent::CloseRequested { .. } => {
-        //             //backend_close_handler().await;
-        //             window.close();
-        //         }
-        //         _ => {} //todo
-        //     }
-        // })
+        .on_window_event(|window, event| {
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    // 检查是否已经调用过shutdown
+                    if SHUTDOWN_CALLED.load(std::sync::atomic::Ordering::Relaxed) {
+                        return; // 如果已经调用过，直接返回让窗口正常关闭
+                    }
+
+                    // 阻止默认关闭
+                    api.prevent_close();
+
+                    // 设置标志，防止重复调用
+                    SHUTDOWN_CALLED.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                    // 异步执行cleanup
+                    //let window_clone = window.clone();
+                    tauri::async_runtime::spawn(async move {
+                        shutdown_caputure().await;
+                        // cleanup完成后退出程序
+                        std::process::exit(0);
+                    });
+                }
+                _ => {}
+            }
+        })
         .manage(AppState {
             is_running: Arc::new(AtomicBool::new(false)),
             exit_flag: Arc::new(AtomicBool::new(false)),
@@ -171,6 +183,7 @@ async fn main() {
             disconnect_by_uuid,
             revoke_control,
             backend_close_handler,
+            shutdown_caputure,
         ])
         .run(tauri::generate_context!())
         .expect("Failed to run Tauri application");

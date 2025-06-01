@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
-use crate::config::{CURRENT_USER, CURRENT_USERS_INFO};
+use crate::{
+    client::{PENDING, SEND_NOTIFY},
+    config::UUID,
+};
 
 use super::user_manager::UserType;
 
@@ -96,16 +100,31 @@ impl CurUsersInfo {
 
     /// 判断是不是控制对象
     pub fn is_controller_by_uuid(&self, uuid: String) -> bool {
-        let curinfos = CURRENT_USERS_INFO.lock().unwrap();
-        let pointer = curinfos.pointer;
-        if pointer < curinfos.usersinfo.len() {
-            curinfos.usersinfo[pointer].uuid == uuid
+        let pointer = self.pointer;
+        if pointer < self.usersinfo.len() {
+            self.usersinfo[pointer].uuid == uuid
         } else {
             false
         }
     }
 
     pub fn revoke_control(&mut self) {
+        let result = CrtlAns {
+            status: "100".to_string(),
+            body: "控制权取回".to_string(),
+        };
+        let uuid = UUID.lock().unwrap().clone();
+        let reply = json!({
+            "type": "message",
+            "target_uuid": self.usersinfo[self.pointer].uuid,
+            "from":uuid,
+            "payload": json!(result),
+        });
+        drop(uuid);
+        let mut pending = PENDING.lock().unwrap();
+        pending.push(reply.clone());
+        drop(pending);
+        SEND_NOTIFY.notify_one();
         self.pointer = self.max
     }
 }
@@ -120,13 +139,14 @@ pub struct CurInfo {
 
 #[derive(Debug, Deserialize)]
 pub struct CrtlReq {
-    uuid: String,
-    device_serial: String,
+    pub jwt: String,
+    pub uuid: String,
+    pub device_serial: String,
 }
 #[derive(Debug, Serialize)]
 pub struct CrtlAns {
-    status: String,
-    body: String,
+    pub status: String,
+    pub body: String,
 }
 // pub async fn handle_control_request(controlreq: CrtlReq) -> CrtlAns {
 //     let curusers = CURRENT_USERS_INFO.lock().unwrap();

@@ -5,6 +5,7 @@ use rusty_duplication::{FrameInfoExt, Scanner, VecCapturer};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use webrtc::media::Sample;
@@ -268,15 +269,15 @@ impl QualityEncoder {
         let loader = openh264::OpenH264API::from_source();
 
         let enc_config = EncoderConfig::new();
-        enc_config.skip_frames(false);
-        enc_config.bitrate(openh264::encoder::BitRate::from_bps(config.bitrate));
-        enc_config.max_frame_rate(openh264::encoder::FrameRate::from_hz(config.fps as f32));
-        enc_config.usage_type(openh264::encoder::UsageType::ScreenContentRealTime);
-        enc_config.profile(openh264::encoder::Profile::Baseline);
-        enc_config.level(openh264::encoder::Level::Level_3_1);
-        enc_config.complexity(openh264::encoder::Complexity::Low);
-        enc_config.qp(QpRange::new(20, 35));
-        enc_config.intra_frame_period(IntraFramePeriod::from_num_frames(
+        let _ = enc_config.skip_frames(false);
+        let _ = enc_config.bitrate(openh264::encoder::BitRate::from_bps(config.bitrate));
+        let _ = enc_config.max_frame_rate(openh264::encoder::FrameRate::from_hz(config.fps as f32));
+        let _ = enc_config.usage_type(openh264::encoder::UsageType::ScreenContentRealTime);
+        let _ = enc_config.profile(openh264::encoder::Profile::Baseline);
+        let _ = enc_config.level(openh264::encoder::Level::Level_3_1);
+        let _ = enc_config.complexity(openh264::encoder::Complexity::Low);
+        let _ = enc_config.qp(QpRange::new(20, 35));
+        let _ = enc_config.intra_frame_period(IntraFramePeriod::from_num_frames(
             config.max_keyframe_interval,
         ));
 
@@ -373,18 +374,28 @@ pub struct MultiStreamManager {
     // WebRTC轨道管理
     track_writers: Arc<RwLock<HashMap<String, Vec<Arc<TrackLocalStaticSample>>>>>,
 
+    // Track写关闭信号
+    track_shutdown_tx: Arc<tokio::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+
+    // Encoder关闭信号
+
     // 控制信号
     shutdown_signal: Arc<AtomicBool>,
     frame_counter: Arc<AtomicU64>,
 
-    // 任务句柄
-    capture_handle: Option<tokio::task::JoinHandle<()>>,
-    encoding_handle: Option<tokio::task::JoinHandle<()>>,
+    // 任务句柄 - 使用独占线程
+    capture_handle: Option<thread::JoinHandle<()>>,
+    encoding_handle: Option<thread::JoinHandle<()>>,
+
+    // 用于与独占线程通信
+    capture_shutdown_tx: Option<mpsc::UnboundedSender<()>>,
+    encoding_shutdown_tx: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl MultiStreamManager {
+    /// 创建一个新的 MultiStreamManager
     pub fn new() -> Self {
-        let (raw_frame_tx, _) = broadcast::channel(8); // 较小的缓冲区，避免延迟
+        let (raw_frame_tx, _) = broadcast::channel(16); // 增加缓冲区以应对突发流量
 
         Self {
             raw_frame_tx,
@@ -395,88 +406,180 @@ impl MultiStreamManager {
             frame_counter: Arc::new(AtomicU64::new(0)),
             capture_handle: None,
             encoding_handle: None,
+            capture_shutdown_tx: None,
+            encoding_shutdown_tx: None,
+            track_shutdown_tx: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
-    /// 启动桌面捕获
+    /// 启动桌面捕获（如果尚未启动）；内部会 spawn 一个任务
     pub async fn start_capture(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.capture_handle.is_some() {
             return Ok(());
         }
 
         let tx = self.raw_frame_tx.clone();
-        let shutdown_signal = self.shutdown_signal.clone();
         let frame_counter = self.frame_counter.clone();
+        let shutdown_signal = self.shutdown_signal.clone();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
 
-        let handle = tokio::spawn(async move {
-            let mut scanner = Scanner::new().expect("failed to create scanner");
-            let monitor = scanner.next().expect("no monitor found");
-            let mut capturer: VecCapturer = monitor.try_into().expect("failed to create capturer");
-
-            let mut last_capture = Instant::now();
-            let capture_interval = Duration::from_millis(16); // ~60fps
-
-            while !shutdown_signal.load(Ordering::Relaxed) {
-                if last_capture.elapsed() < capture_interval {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    continue;
+        // 创建独占线程进行屏幕捕获
+        let handle = thread::Builder::new()
+            .name("screen-capture".to_string())
+            .spawn(move || {
+                // 设置线程优先级（如果系统支持）
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use winapi::um::processthreadsapi::{GetCurrentThread, SetThreadPriority};
+                    use winapi::um::winbase::THREAD_PRIORITY_ABOVE_NORMAL;
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL as i32);
                 }
 
-                if let Ok(info) = capturer.capture() {
-                    if info.desktop_updated() {
-                        let desc = capturer.monitor().dxgi_outdupl_desc();
-                        let frame_id = frame_counter.fetch_add(1, Ordering::Relaxed);
+                let mut scanner = Scanner::new().expect("failed to create scanner");
+                let monitor = scanner.next().expect("no monitor found");
+                let mut capturer: VecCapturer =
+                    monitor.try_into().expect("failed to create capturer");
 
-                        let raw_frame = RawFrame {
-                            width: desc.ModeDesc.Width,
-                            height: desc.ModeDesc.Height,
-                            data: Arc::new(capturer.buffer.clone()),
-                            timestamp: frame_id, // 简化时间戳
-                            frame_id,
-                        };
+                let mut last_capture = Instant::now();
+                let capture_interval = Duration::from_nanos(16_666_667); // 精确60fps
 
-                        last_capture = Instant::now();
+                // 预分配缓冲区以减少内存分配
+                let mut frame_buffer = Vec::new();
 
-                        if tx.send(raw_frame).is_err() {
-                            break; // 所有接收者都已关闭
+                loop {
+                    // 检查关闭信号
+                    if shutdown_signal.load(Ordering::Relaxed) || shutdown_rx.try_recv().is_ok() {
+                        break;
+                    }
+
+                    let now = Instant::now();
+                    if now.duration_since(last_capture) < capture_interval {
+                        // 精确的睡眠时间
+                        let sleep_time = capture_interval - now.duration_since(last_capture);
+                        if sleep_time > Duration::from_micros(100) {
+                            thread::sleep(sleep_time - Duration::from_micros(50));
+                        } else {
+                            thread::yield_now();
+                        }
+                        continue;
+                    }
+
+                    match capturer.capture() {
+                        Ok(info) if info.desktop_updated() => {
+                            let desc = capturer.monitor().dxgi_outdupl_desc();
+                            let frame_id = frame_counter.fetch_add(1, Ordering::Relaxed);
+
+                            // 复用缓冲区
+                            frame_buffer.clear();
+                            frame_buffer.extend_from_slice(&capturer.buffer);
+
+                            let raw_frame = RawFrame {
+                                width: desc.ModeDesc.Width,
+                                height: desc.ModeDesc.Height,
+                                data: Arc::new(frame_buffer.clone()),
+                                timestamp: frame_id,
+                                frame_id,
+                            };
+
+                            last_capture = now;
+
+                            if tx.send(raw_frame).is_err() {
+                                break; // 所有接收者都已关闭
+                            }
+                        }
+                        Ok(_) => {
+                            // 桌面未更新，短暂休眠
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => {
+                            // 捕获错误，短暂休眠后重试
+                            thread::sleep(Duration::from_millis(5));
                         }
                     }
                 }
-
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        });
+            })?;
 
         self.capture_handle = Some(handle);
+        self.capture_shutdown_tx = Some(shutdown_tx);
+
+        // 启动编码工作线程
         self.start_encoding_worker().await;
 
         Ok(())
     }
 
-    /// 启动编码工作线程
+    /// 启动编码工作线程（如果尚未启动）；内部会 spawn 一个任务
     async fn start_encoding_worker(&mut self) {
         if self.encoding_handle.is_some() {
             return;
         }
 
-        let mut raw_rx = self.raw_frame_tx.subscribe();
+        let raw_rx = self.raw_frame_tx.subscribe();
         let encoders = self.encoders.clone();
         let encoded_streams = self.encoded_streams.clone();
+        let track_writers = self.track_writers.clone();
         let shutdown_signal = self.shutdown_signal.clone();
+        let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
-        let handle = tokio::spawn(async move {
-            while !shutdown_signal.load(Ordering::Relaxed) {
-                match tokio::time::timeout(Duration::from_millis(50), raw_rx.recv()).await {
-                    Ok(Ok(raw_frame)) => {
-                        // 获取所有编码器的快照
+        let handle = thread::Builder::new()
+            .name("video-encoder".to_string())
+            .spawn(move || {
+                Self::encoding_worker_thread(
+                    raw_rx,
+                    encoders,
+                    encoded_streams,
+                    track_writers,
+                    shutdown_signal,
+                    shutdown_rx,
+                );
+            })
+            .expect("Failed to spawn encoding thread");
+
+        self.encoding_handle = Some(handle);
+        self.encoding_shutdown_tx = Some(shutdown_tx);
+    }
+
+    /// 独占线程的编码工作函数
+    fn encoding_worker_thread(
+        mut raw_rx: broadcast::Receiver<RawFrame>,
+        encoders: Arc<Mutex<HashMap<String, QualityEncoder>>>,
+        encoded_streams: Arc<RwLock<HashMap<String, broadcast::Sender<EncodedFrame>>>>,
+        track_writers: Arc<RwLock<HashMap<String, Vec<Arc<TrackLocalStaticSample>>>>>,
+        shutdown_signal: Arc<AtomicBool>,
+        mut shutdown_rx: mpsc::UnboundedReceiver<()>,
+    ) {
+        // 设置线程优先级
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use winapi::um::processthreadsapi::{GetCurrentThread, SetThreadPriority};
+            use winapi::um::winbase::THREAD_PRIORITY_ABOVE_NORMAL;
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL as i32);
+        }
+
+        // 创建一个轻量级的运行时用于锁操作
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+
+        loop {
+            // 检查关闭信号
+            if shutdown_signal.load(Ordering::Relaxed) || shutdown_rx.try_recv().is_ok() {
+                break;
+            }
+
+            match raw_rx.try_recv() {
+                Ok(raw_frame) => {
+                    rt.block_on(async {
+                        // 快速获取编码器快照
                         let mut encoder_guard = encoders.lock().await;
-                        let mut encoded_frames = Vec::new();
+                        let mut encoding_tasks = Vec::new();
 
                         // 对每个质量进行编码
                         for (quality_name, encoder) in encoder_guard.iter_mut() {
                             match encoder.encode(&raw_frame) {
                                 Ok(Some(encoded_frame)) => {
-                                    encoded_frames.push((quality_name.clone(), encoded_frame));
+                                    encoding_tasks.push((quality_name.clone(), encoded_frame));
                                 }
                                 Ok(None) => {
                                     // 跳帧，正常情况
@@ -489,24 +592,35 @@ impl MultiStreamManager {
 
                         drop(encoder_guard);
 
-                        // 分发编码后的帧
-                        let streams = encoded_streams.read().await;
-                        for (quality_name, encoded_frame) in encoded_frames {
-                            if let Some(tx) = streams.get(&quality_name) {
-                                let _ = tx.send(encoded_frame); // 忽略发送错误
+                        // 只分发到广播通道，WebRTC轨道由独立的tokio任务处理
+                        if !encoding_tasks.is_empty() {
+                            let streams = encoded_streams.read().await;
+
+                            for (quality_name, encoded_frame) in encoding_tasks {
+                                // 发送到广播通道，WebRTC任务会从这里接收
+                                if let Some(tx) = streams.get(&quality_name) {
+                                    let _ = tx.send(encoded_frame);
+                                }
                             }
                         }
-                    }
-                    Ok(Err(_)) => break, // 发送者关闭
-                    Err(_) => continue,  // 超时，继续等待
+                    });
+                }
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    // 没有新帧，短暂休眠
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    // 处理滞后，跳过旧帧
+                    continue;
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    break; // 发送者关闭
                 }
             }
-        });
-
-        self.encoding_handle = Some(handle);
+        }
     }
 
-    /// 添加质量流
+    /// 添加一个新的质量流，返回可订阅的 EncodedFrame 接收器
     pub async fn add_quality_stream(
         &self,
         config: QualityConfig,
@@ -535,13 +649,19 @@ impl MultiStreamManager {
             let mut streams = self.encoded_streams.write().await;
 
             encoders.insert(quality_name.clone(), encoder);
-            streams.insert(quality_name, tx);
+            streams.insert(quality_name.clone(), tx);
+        }
+
+        // 初始化轨道列表（为了兼容性保留）
+        {
+            let mut tracks = self.track_writers.write().await;
+            tracks.insert(quality_name, Vec::new());
         }
 
         Ok(rx)
     }
 
-    /// 为质量流添加WebRTC轨道
+    /// 为指定质量流添加一个 WebRTC 轨道，该轨道会消费对应质量的 EncodedFrame
     pub async fn add_webrtc_track(
         &self,
         quality_name: &str,
@@ -557,7 +677,7 @@ impl MultiStreamManager {
             tx.subscribe()
         };
 
-        // 添加到轨道管理器
+        // 添加到轨道管理器（为了统计和管理目的）
         {
             let mut track_writers = self.track_writers.write().await;
             track_writers
@@ -569,9 +689,17 @@ impl MultiStreamManager {
         // 启动WebRTC写入任务
         let shutdown_signal = self.shutdown_signal.clone();
         let quality_name = quality_name.to_string();
-
+        let this_shutdown_signal = Arc::new(AtomicBool::new(false));
+        let mut hash_gaurd = self.track_shutdown_tx.lock().await;
+        if hash_gaurd.contains_key(&quality_name) {
+            return Ok(());
+        }
+        hash_gaurd.insert(quality_name.clone(), this_shutdown_signal.clone());
+        drop(hash_gaurd);
         tokio::spawn(async move {
-            while !shutdown_signal.load(Ordering::Relaxed) {
+            while !(shutdown_signal.load(Ordering::Relaxed)
+                || this_shutdown_signal.load(Ordering::Relaxed))
+            {
                 match tokio::time::timeout(Duration::from_millis(100), encoded_rx.recv()).await {
                     Ok(Ok(encoded_frame)) => {
                         let sample = Sample {
@@ -600,7 +728,18 @@ impl MultiStreamManager {
         Ok(())
     }
 
-    /// 移除质量流
+    /// 关闭指定的Track写入
+    pub async fn close_track_write(&mut self, quality_name: &str) {
+        let mut hash_gaurd = self.track_shutdown_tx.lock().await;
+        if let Some(track_shutdown) = hash_gaurd.remove(quality_name) {
+            track_shutdown.store(true, Ordering::Relaxed);
+            self.remove_quality_stream(quality_name).await;
+            println!("[ASSEMBLY]成功关闭写入 {:?}", quality_name)
+        } else {
+            println!("[ASSEMBLY]失败关闭写入 {:?}", quality_name)
+        };
+    }
+    /// 移除指定的质量流及其相关资源
     pub async fn remove_quality_stream(&self, quality_name: &str) {
         let mut encoders = self.encoders.lock().await;
         let mut streams = self.encoded_streams.write().await;
@@ -609,8 +748,9 @@ impl MultiStreamManager {
         encoders.remove(quality_name);
         streams.remove(quality_name);
         track_writers.remove(quality_name);
-    }
 
+        // 注意：相关的WebRTC写入任务会在接收到关闭的广播通道时自动结束
+    }
     /// 获取活跃的质量配置
     pub async fn get_active_qualities(&self) -> Vec<String> {
         let encoders = self.encoders.lock().await;
@@ -621,18 +761,35 @@ impl MultiStreamManager {
     pub async fn shutdown(&mut self) {
         self.shutdown_signal.store(true, Ordering::Relaxed);
 
+        // 关闭捕获线程
+        if let Some(tx) = self.capture_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
         if let Some(handle) = self.capture_handle.take() {
-            let _ = handle.await;
+            let _ = handle.join();
         }
 
+        // 关闭编码线程
+        if let Some(tx) = self.encoding_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
         if let Some(handle) = self.encoding_handle.take() {
-            let _ = handle.await;
+            let _ = handle.join();
         }
 
         // 清理资源
-        self.encoders.lock().await.clear();
-        self.encoded_streams.write().await.clear();
-        self.track_writers.write().await.clear();
+        {
+            let mut encoders = self.encoders.lock().await;
+            encoders.clear();
+        }
+        {
+            let mut streams = self.encoded_streams.write().await;
+            streams.clear();
+        }
+        {
+            let mut tracks = self.track_writers.write().await;
+            tracks.clear();
+        }
     }
 }
 

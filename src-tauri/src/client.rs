@@ -36,19 +36,20 @@ struct PayloadWithCmd {
 use crate::{
     client_utils::{
         auth::{validate_jwt, AuthRequest},
+        current_user::{CrtlAns, CrtlReq, CurUsersInfo},
         dialog::show_iknow_dialog,
         disconnect::DisconnectReq,
         password::generate_connection_password,
     },
     config::{update_uuid, CONFIG, CURRENT_USERS_INFO, UUID},
-    webrtc::webrtc_connect::{send_ice_candidate, JWTCandidateRequest, JWTOfferRequest},
+    webrtc::webrtc_connect::{close_peerconnection, JWTCandidateRequest, JWTOfferRequest},
 };
 lazy_static! {
     pub static ref CLOSE_NOTIFY: Arc<Notify> = Arc::new(Notify::new());
     pub static ref SEND_NOTIFY: Arc<Notify> = Arc::new(Notify::new());
     pub static ref PENDING: Mutex<Vec<Value>> = Mutex::new(vec![]);
 }
-pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start_client(_exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
     let server_ws = CONFIG.lock().unwrap().server_address.clone(); // ws:// 或 wss://
     generate_connection_password().await;
     println!("[CLIENT] Connecting to {}...", server_ws);
@@ -102,7 +103,9 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                 _ = CLOSE_NOTIFY.notified() => {
                     println!("[CLIENT] Exit requested, sending close JSON");
                     let close_json = json!({ "type": "close" });
-                    send_lock.lock();
+                    if let Err(e) =  send_lock.lock(){
+                        println!("[CLIENT] send lock {:?}",e)
+                    };
                     connection.send(Message::Text(close_json.to_string().into())).await?;
                     drop(send_lock.lock().unwrap());
                     // 继续等服务器发协议层的 Close 帧，或者直接 break 结束
@@ -119,7 +122,9 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                             "from":uuid
                         });
                         drop(uuid);
-                        send_lock.lock();
+                        if let Err(e) =  send_lock.lock(){
+                        println!("[CLIENT] send lock {:?}",e)
+                    };
                         connection.send(Message::Text(ping_json.to_string().into())).await?;
                         drop(send_lock.lock().unwrap());
                     }
@@ -218,7 +223,7 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                                             if let Ok(auth_req) =
                                                 serde_json::from_str::<AuthRequest>(p.data.as_str().unwrap())
                                             {
-                                                println!("[message]payload value {:?}",auth_req);
+                                                //println!("[message]payload value {:?}",auth_req);
                                                 tokio::spawn(async move{
 
                                                     let result =
@@ -250,7 +255,7 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                                             if let Ok(jwt_offer_req)=
                                                 serde_json::from_str::<JWTOfferRequest>(p.data.as_str().unwrap())
                                             {
-                                                println!("[message]payload value {:?}",jwt_offer_req);
+                                                //println!("[message]payload value {:?}",jwt_offer_req);
                                                 if !validate_jwt(&jwt_offer_req.jwt){
                                                     println!("[OFFER_HANDLER]来自{:?}的JWT验证失败",msg.from);
                                                     break;
@@ -345,7 +350,91 @@ pub async fn start_client(exit_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std:
                                                 }
                                         }
                                         "control"=>{
+                                            if let Ok(control_req)=
+                                            serde_json::from_str::<CrtlReq>(p.data.as_str().unwrap()){
+                                                tokio::spawn(async move{
+                                                    //let res=crate::webrtc::webrtc_connect::handle_webrtc_offer(web::Json(disconnect_req)).await;
+                                                    // JWT验证
+                                                    let body:String;
+                                                    let status =if !validate_jwt(&control_req.jwt)||CURRENT_USERS_INFO.lock().unwrap().has_controller(){
+                                                        println!("[CONTROL]已有控制者");
+                                                        body="已有控制者".to_string();
+                                                        "400"
 
+                                                    }else if CURRENT_USERS_INFO.lock().unwrap().set_ptr_by_serial(&control_req.device_serial) {
+                                                        body="获得控制权".to_string();
+                                                        "200"
+                                                    }else{
+                                                        body="用户不存在".to_string();
+                                                        "400"
+                                                    };
+                                                    let result=CrtlAns{ status: status.to_string(), body:body };
+                                                    let uuid=UUID.lock().unwrap().clone();
+                                                    let reply = json!({
+                                                        "type": "message",
+                                                        "target_uuid": msg.from,
+                                                        "from":uuid,
+                                                        "payload": json!(result),
+                                                    });
+                                                    drop(uuid);
+                                                    let mut pending=PENDING.lock().unwrap();
+                                                    pending.push(reply.clone());
+                                                    drop(pending);
+                                                    SEND_NOTIFY.notify_one();
+
+                                                    });
+                                            }
+                                        }
+                                        "revokectrl"=>{
+                                            if let Ok(control_req)=
+                                            serde_json::from_str::<CrtlReq>(p.data.as_str().unwrap()){
+                                                tokio::spawn(async move{
+
+                                                    if !validate_jwt(&control_req.jwt){
+                                                        return ;
+                                                    }
+                                                    if CURRENT_USERS_INFO.lock().unwrap().is_controller_by_uuid(control_req.uuid.clone()){
+                                                        close_peerconnection(&control_req.uuid).await
+                                                    }
+
+                                                    });
+                                            }
+                                        }
+                                        "closertc"=>{
+                                            if let Ok(control_req)=
+                                            serde_json::from_str::<CrtlReq>(p.data.as_str().unwrap()){
+                                                tokio::spawn(async move{
+                                                    //let res=crate::webrtc::webrtc_connect::handle_webrtc_offer(web::Json(disconnect_req)).await;
+                                                    // JWT验证
+                                                    let body:String;
+                                                    let status =if !validate_jwt(&control_req.jwt)||CURRENT_USERS_INFO.lock().unwrap().has_controller(){
+                                                        println!("[CONTROL]已有控制者");
+                                                        body="已有控制者".to_string();
+                                                        "400"
+
+                                                    }else if CURRENT_USERS_INFO.lock().unwrap().set_ptr_by_serial(&control_req.device_serial) {
+                                                        body="获得控制权".to_string();
+                                                        "200"
+                                                    }else{
+                                                        body="用户不存在".to_string();
+                                                        "400"
+                                                    };
+                                                    let result=CrtlAns{ status: status.to_string(), body:body };
+                                                    let uuid=UUID.lock().unwrap().clone();
+                                                    let reply = json!({
+                                                        "type": "message",
+                                                        "target_uuid": msg.from,
+                                                        "from":uuid,
+                                                        "payload": json!(result),
+                                                    });
+                                                    drop(uuid);
+                                                    let mut pending=PENDING.lock().unwrap();
+                                                    pending.push(reply.clone());
+                                                    drop(pending);
+                                                    SEND_NOTIFY.notify_one();
+
+                                                    });
+                                            }
                                         }
 
                                         _ => println!("[CLIENT] Unknown cmd: {}", p.cmd),
